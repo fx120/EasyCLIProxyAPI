@@ -4,6 +4,7 @@ import {
   clampGrabConcurrency,
   clampGrabIntervalMs,
   runAnyRouterGrabLoop,
+  runAnyRouterKeepalive,
   type GrabStopReason,
 } from './anyrouterLineGrab';
 import { normalizeBaseUrl } from './modelService';
@@ -24,6 +25,7 @@ export type GrabSessionSnapshot = {
   reason: GrabSessionReason;
   detail: string;
   active: boolean;
+  keepalive: boolean;
 };
 
 export type GrabSessionTarget = {
@@ -50,12 +52,20 @@ const EMPTY_SESSION: GrabSessionSnapshot = {
   reason: '',
   detail: '',
   active: false,
+  keepalive: false,
 };
 
 const sessions = new Map<string, GrabSessionSnapshot>();
 const controllers = new Map<string, AbortController>();
+const keepaliveControllers = new Map<string, AbortController>();
+const launchTokens = new Map<string, object>();
 const listeners = new Set<() => void>();
 const successListeners = new Set<() => void>();
+type KeepaliveRuntime = {
+  sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  random: () => number;
+};
+let keepaliveRuntime: KeepaliveRuntime | null = null;
 let hydrated = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let storageOverride: StorageLike | null = null;
@@ -121,7 +131,8 @@ function sanitizeSession(value: unknown): GrabSessionSnapshot | null {
     status: typeof record.status === 'number' ? record.status : null,
     reason: typeof record.reason === 'string' ? record.reason as GrabSessionReason : '',
     detail: typeof record.detail === 'string' ? record.detail : '',
-    active: record.active === true || record.running === true || Number(record.attempts) > 0,
+    active: record.active === true || record.running === true || record.keepalive === true || Number(record.attempts) > 0,
+    keepalive: record.keepalive === true,
   };
 }
 
@@ -202,7 +213,7 @@ export function patchGrabSessionConfig(
   patch: Partial<Pick<GrabSessionSnapshot, 'intervalMs' | 'threads' | 'model'>>,
 ) {
   const current = getGrabSession(key);
-  if (current.running) return;
+  if (current.running || current.keepalive) return;
   replaceSession(key, {
     ...current,
     ...patch,
@@ -216,8 +227,33 @@ function freezeElapsed(session: GrabSessionSnapshot, now = Date.now()): number {
   return Math.max(0, now - session.startedAt);
 }
 
+function notifyProviderChanged() {
+  successListeners.forEach((listener) => listener());
+}
+
+function startKeepalive(key: string, target: GrabSessionTarget, model: string) {
+  if (!model.trim() || keepaliveControllers.has(key)) return;
+  const controller = new AbortController();
+  keepaliveControllers.set(key, controller);
+  void runAnyRouterKeepalive({
+    baseUrl: target.baseUrl,
+    apiKey: target.apiKey,
+    model,
+    customHeaders: target.customHeaders,
+    signal: controller.signal,
+    sleep: keepaliveRuntime?.sleep,
+    random: keepaliveRuntime?.random,
+  }).finally(() => {
+    if (keepaliveControllers.get(key) === controller) keepaliveControllers.delete(key);
+  });
+}
+
 function launch(key: string, target: GrabSessionTarget, session: GrabSessionSnapshot, resetCounters: boolean) {
+  const token = {};
+  launchTokens.set(key, token);
   controllers.get(key)?.abort();
+  keepaliveControllers.get(key)?.abort();
+  keepaliveControllers.delete(key);
   const baseAttempts = resetCounters ? 0 : session.attempts;
   const startedAt = resetCounters || session.startedAt == null
     ? Date.now() - (resetCounters ? 0 : session.elapsedMs)
@@ -233,6 +269,7 @@ function launch(key: string, target: GrabSessionTarget, session: GrabSessionSnap
     reason: resetCounters ? '' : session.reason,
     detail: resetCounters ? '' : session.detail,
     active: true,
+    keepalive: false,
   };
   const controller = new AbortController();
   controllers.set(key, controller);
@@ -263,10 +300,15 @@ function launch(key: string, target: GrabSessionTarget, session: GrabSessionSnap
         attempts: Math.max(current.attempts, baseAttempts + update.attempts),
       });
     },
+    onDisabled: () => {
+      if (launchTokens.get(key) !== token || controllers.get(key) !== controller) return;
+      notifyProviderChanged();
+    },
   }).then((result) => {
-    if (controllers.get(key) !== controller) return;
+    if (launchTokens.get(key) !== token || controllers.get(key) !== controller) return;
     controllers.delete(key);
     const current = sessions.get(key) ?? next;
+    const kept = result.reason === 'success';
     const stopped: GrabSessionSnapshot = {
       ...current,
       running: false,
@@ -279,9 +321,12 @@ function launch(key: string, target: GrabSessionTarget, session: GrabSessionSnap
         : result.reason,
       detail: result.detail || current.detail,
       active: true,
+      keepalive: kept,
     };
     replaceSession(key, stopped, true);
-    if (result.reason === 'success') successListeners.forEach((listener) => listener());
+    if (!kept || launchTokens.get(key) !== token) return;
+    notifyProviderChanged();
+    startKeepalive(key, target, stopped.model);
   });
 }
 
@@ -296,18 +341,28 @@ export function startGrabSession(key: string, target: GrabSessionTarget, model: 
 
 export function resumeGrabSessionIfNeeded(key: string, target: GrabSessionTarget) {
   const current = getGrabSession(key);
-  if (!current.running || !current.model.trim() || controllers.has(key)) return;
-  launch(key, target, current, false);
+  if (current.running && current.model.trim() && !controllers.has(key)) {
+    launch(key, target, current, false);
+    return;
+  }
+  if (current.keepalive && current.model.trim() && !keepaliveControllers.has(key)) {
+    if (!launchTokens.has(key)) launchTokens.set(key, {});
+    startKeepalive(key, target, current.model);
+  }
 }
 
 export function stopGrabSession(key: string) {
   const current = getGrabSession(key);
-  if (!current.active && !controllers.has(key)) return;
+  if (!current.active && !controllers.has(key) && !keepaliveControllers.has(key)) return;
+  launchTokens.delete(key);
   controllers.get(key)?.abort();
   controllers.delete(key);
+  keepaliveControllers.get(key)?.abort();
+  keepaliveControllers.delete(key);
   replaceSession(key, {
     ...current,
     running: false,
+    keepalive: false,
     startedAt: null,
     elapsedMs: freezeElapsed(current),
     active: true,
@@ -322,6 +377,9 @@ export function resetGrabSessionsForTests() {
   }
   controllers.forEach((controller) => controller.abort());
   controllers.clear();
+  keepaliveControllers.forEach((controller) => controller.abort());
+  keepaliveControllers.clear();
+  launchTokens.clear();
   sessions.clear();
   hydrated = false;
   hydrate();
@@ -330,4 +388,8 @@ export function resetGrabSessionsForTests() {
 export function setGrabSessionStorageForTests(storage: StorageLike | null) {
   storageOverride = storage;
   resetGrabSessionsForTests();
+}
+
+export function setGrabKeepaliveRuntimeForTests(runtime: KeepaliveRuntime | null) {
+  keepaliveRuntime = runtime;
 }

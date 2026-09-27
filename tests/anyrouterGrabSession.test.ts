@@ -75,6 +75,14 @@ describe('AnyRouter grab session', () => {
       status_code: 404,
       body: { error: { message: '当前 API 不支持所选模型 gpt-6-astra' } },
     } as never);
+    const get = spyOn(managementApi, 'get').mockResolvedValue({
+      'openai-compatibility': [{
+        name: target.providerName,
+        'base-url': target.baseUrl,
+        'api-key-entries': [{ 'api-key': target.apiKey }],
+      }],
+    } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
     const key = anyRouterGrabSessionKey(target.providerName, target.baseUrl, target.apiKey);
     patchGrabSessionConfig(key, { intervalMs: 50, threads: 2, model: 'gpt-6-astra' });
 
@@ -116,6 +124,8 @@ describe('AnyRouter grab session', () => {
     expect(getGrabSession(key).attempts).toBeGreaterThanOrEqual(attempts);
     expect(storage.getItem(ANYROUTER_GRAB_SESSION_STORAGE_KEY) ?? '').not.toContain('sk-test-key');
     post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
   });
 
   it('restores a running session and continues the same attempt count', async () => {
@@ -150,6 +160,14 @@ describe('AnyRouter grab session', () => {
       status_code: 500,
       body: { error: { message: 'busy' } },
     } as never);
+    const get = spyOn(managementApi, 'get').mockResolvedValue({
+      'openai-compatibility': [{
+        name: target.providerName,
+        'base-url': target.baseUrl,
+        'api-key-entries': [{ 'api-key': target.apiKey }],
+      }],
+    } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
     resumeGrabSessionIfNeeded(key, target);
     await waitFor(() => getGrabSession(key).attempts > 7 && getGrabSession(key).status === 500);
     expect(getGrabSession(key).startedAt).toBe(startedAt);
@@ -158,5 +176,7 @@ describe('AnyRouter grab session', () => {
 
     stopGrabSession(key);
     post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
   });
 });

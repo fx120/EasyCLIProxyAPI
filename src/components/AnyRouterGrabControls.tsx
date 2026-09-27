@@ -62,7 +62,7 @@ export function AnyRouterGrabControls({
     const names = modelList ? modelList.split('\0') : [];
     if (names.length === 0) return;
     const current = getGrabSession(key);
-    if (current.running || !current.model || names.includes(current.model)) return;
+    if (current.running || current.keepalive || !current.model || names.includes(current.model)) return;
     patchGrabSessionConfig(key, { model: '' });
   }, [key, modelList]);
 
@@ -73,6 +73,7 @@ export function AnyRouterGrabControls({
     return () => window.clearInterval(timer);
   }, [session.running, session.startedAt]);
 
+  const held = session.running || session.keepalive;
   const elapsedMs = session.running && session.startedAt != null
     ? Math.max(0, now - session.startedAt)
     : session.elapsedMs;
@@ -94,7 +95,7 @@ export function AnyRouterGrabControls({
         <span>{t('apiAccess.grab.model')}</span>
         <select
           value={session.model}
-          disabled={session.running}
+          disabled={held}
           onChange={(event) => {
             setMissingModel(false);
             patchGrabSessionConfig(key, { model: event.currentTarget.value });
@@ -113,7 +114,7 @@ export function AnyRouterGrabControls({
           min={ANYROUTER_GRAB_MIN_INTERVAL_MS}
           step={50}
           value={session.intervalMs}
-          disabled={session.running}
+          disabled={held}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);
             patchGrabSessionConfig(key, {
@@ -130,7 +131,7 @@ export function AnyRouterGrabControls({
           max={ANYROUTER_GRAB_MAX_CONCURRENCY}
           step={1}
           value={session.threads}
-          disabled={session.running}
+          disabled={held}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);
             patchGrabSessionConfig(key, {
@@ -139,7 +140,7 @@ export function AnyRouterGrabControls({
           }}
         />
       </label>
-      {session.running ? (
+      {held ? (
         <button type="button" className="secondary-button compact-button" onClick={() => stopGrabSession(key)}>
           {t('apiAccess.grab.stop')}
         </button>
@@ -149,8 +150,8 @@ export function AnyRouterGrabControls({
         </button>
       )}
       {session.active ? (
-        <span className={`provider-grab-activity ${session.running ? 'running' : 'stopped'}`}>
-          <span>{session.running ? t('apiAccess.grab.running') : t('apiAccess.grab.stopped')}</span>
+        <span className={`provider-grab-activity ${session.running ? 'running' : session.keepalive ? 'keepalive' : 'stopped'}`}>
+          <span>{session.running ? t('apiAccess.grab.running') : session.keepalive ? t('apiAccess.grab.keepalive') : t('apiAccess.grab.stopped')}</span>
           <span>{t('apiAccess.grab.elapsed', { time: formatGrabElapsed(elapsedMs) })}</span>
           <span>{t('apiAccess.grab.attempts', { count: session.attempts })}</span>
         </span>
@@ -182,6 +183,7 @@ function describeGrab(
   if (session.reason === 'missing-model') return t('apiAccess.grab.missingModel');
   if (session.reason === 'missing-fingerprint') return t('apiAccess.grab.missingFingerprint');
   if (session.reason === 'enable-failed') return t('apiAccess.grab.enableFailed', { reason: session.detail });
+  if (session.reason === 'disable-failed') return t('apiAccess.grab.disableFailed', { reason: session.detail });
   if (session.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: session.detail });
   if (session.reason === 'auth') {
     return t('apiAccess.grab.authFailed', { status: session.status ?? '—', reason: session.detail });

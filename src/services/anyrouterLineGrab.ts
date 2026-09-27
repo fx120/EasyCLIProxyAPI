@@ -20,6 +20,8 @@ export const ANYROUTER_GRAB_MIN_INTERVAL_MS = 50;
 export const ANYROUTER_GRAB_DEFAULT_INTERVAL_MS = 2_000;
 export const ANYROUTER_GRAB_MAX_CONCURRENCY = 32;
 export const ANYROUTER_GRAB_DEFAULT_CONCURRENCY = 1;
+export const ANYROUTER_KEEPALIVE_MIN_MS = 3 * 60 * 1000;
+export const ANYROUTER_KEEPALIVE_MAX_MS = 5 * 60 * 1000;
 
 const FINGERPRINT_NAMES = Object.keys(CODEX_CLIENT_FINGERPRINT_HEADERS) as Array<
   keyof typeof CODEX_CLIENT_FINGERPRINT_HEADERS
@@ -47,6 +49,7 @@ export type GrabStopReason =
   | 'missing-model'
   | 'request-failed'
   | 'enable-failed'
+  | 'disable-failed'
   | 'aborted';
 
 export type GrabStatusUpdate = {
@@ -96,6 +99,26 @@ export function anyRouterGrabModels(models: ModelOption[]): string[] {
     .filter(Boolean);
 }
 
+const CODEX_FINGERPRINT_HEADER_NAMES = new Set(
+  Object.keys(CODEX_CLIENT_FINGERPRINT_HEADERS).map((name) => name.toLowerCase()),
+);
+
+/**
+ * Drop any client-identity header, including a differently cased CPA User-Agent,
+ * then apply the Codex fingerprint. Header.Set in CPA's /requests/api-call
+ * canonicalizes names, so a leftover `user-agent` would replace `User-Agent`.
+ */
+export function headersWithCodexFingerprint(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const kept: Record<string, string> = {};
+  Object.entries(headers).forEach(([name, value]) => {
+    if (CODEX_FINGERPRINT_HEADER_NAMES.has(name.toLowerCase())) return;
+    kept[name] = value;
+  });
+  return { ...kept, ...codexClientFingerprintHeaders() };
+}
+
 /** Chat-completions probe 健康检测 already builds for an OpenAI-compatible base. */
 export function buildAnyRouterGrabProbe(
   baseUrl: string,
@@ -105,10 +128,50 @@ export function buildAnyRouterGrabProbe(
 ) {
   if (!baseUrl.trim()) throw new Error('missing base url');
   if (!model.trim()) throw new Error('missing model');
-  return buildProviderHealthProbe('openai', baseUrl, model, apiKey, '', {
-    ...customHeaders,
-    ...codexClientFingerprintHeaders(),
-  });
+  return buildProviderHealthProbe(
+    'openai',
+    baseUrl,
+    model,
+    apiKey,
+    '',
+    headersWithCodexFingerprint(customHeaders),
+  );
+}
+
+/** Same chat probe as a grab, with a short random user message. */
+export function buildAnyRouterKeepaliveProbe(
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+  content: string,
+  customHeaders: Record<string, string> = {},
+) {
+  const message = content.trim();
+  if (!message) throw new Error('missing content');
+  const probe = buildAnyRouterGrabProbe(baseUrl, model, apiKey, customHeaders);
+  const body = JSON.parse(probe.data) as {
+    model: string;
+    messages: Array<{ role: string; content: string }>;
+    stream: boolean;
+  };
+  body.messages = [{ role: 'user', content: message }];
+  return { ...probe, data: JSON.stringify(body) };
+}
+
+export function nextKeepaliveDelayMs(random: () => number = Math.random): number {
+  const unit = Math.min(1, Math.max(0, random()));
+  const span = ANYROUTER_KEEPALIVE_MAX_MS - ANYROUTER_KEEPALIVE_MIN_MS;
+  return ANYROUTER_KEEPALIVE_MIN_MS + Math.round(unit * span);
+}
+
+export function randomKeepaliveContent(random: () => number = Math.random): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let body = '';
+  for (let index = 0; index < 12; index += 1) {
+    const unit = Math.min(0.999999, Math.max(0, random()));
+    body += alphabet[Math.floor(unit * alphabet.length)] ?? 'a';
+  }
+  return body;
 }
 
 export function clampGrabIntervalMs(value: number): number {
@@ -186,15 +249,23 @@ export function findOpenAiCompatibilityIndex(
   });
 }
 
-export async function enableOpenAiCompatibilityProvider(match: OpenAiProviderMatch): Promise<void> {
+export async function setOpenAiCompatibilityProviderDisabled(
+  match: OpenAiProviderMatch,
+  disabled: boolean,
+): Promise<void> {
   const payload = await managementApi.get('/openai-compatibility');
   const records = responseList(payload, 'openai-compatibility');
   const index = findOpenAiCompatibilityIndex(records, match);
   if (index < 0) throw new Error('OpenAI compatibility entry no longer exists');
   await managementApi.patch('/openai-compatibility', {
     index,
-    value: { disabled: false },
+    value: { disabled },
   });
+}
+
+/** Enables the saved provider. CLIProxyAPI then includes it in the routing client set. */
+export async function enableOpenAiCompatibilityProvider(match: OpenAiProviderMatch): Promise<void> {
+  await setOpenAiCompatibilityProviderDisabled(match, false);
 }
 
 export function waitForGrabInterval(ms: number, signal: AbortSignal): Promise<void> {
@@ -228,6 +299,7 @@ export async function runAnyRouterGrabLoop(options: {
   signal: AbortSignal;
   onStatus?: (update: GrabStatusUpdate) => void;
   onAttempt?: (attempts: number) => void;
+  onDisabled?: () => void;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }): Promise<GrabLoopResult> {
   const sleep = options.sleep ?? waitForGrabInterval;
@@ -280,6 +352,26 @@ export async function runAnyRouterGrabLoop(options: {
   }
   if (!grabRequestHasCodexFingerprint(probe.header)) {
     return publish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '', attempts: 0 });
+  }
+
+  try {
+    await setOpenAiCompatibilityProviderDisabled({
+      name: options.providerName,
+      baseUrl: options.baseUrl,
+      apiKey,
+    }, true);
+    options.onDisabled?.();
+  } catch (error) {
+    return publish({
+      phase: 'stopped',
+      status: null,
+      reason: 'disable-failed',
+      detail: errorText(error),
+      attempts: 0,
+    });
+  }
+  if (options.signal.aborted) {
+    return { phase: 'stopped', status: null, reason: 'aborted', detail: '', attempts: 0 };
   }
 
   const intervalMs = clampGrabIntervalMs(options.intervalMs);
@@ -401,4 +493,40 @@ export async function runAnyRouterGrabLoop(options: {
     detail: terminal?.detail ?? '',
     attempts: gate.attempts,
   };
+}
+
+export async function runAnyRouterKeepalive(options: {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  customHeaders?: Record<string, string>;
+  signal: AbortSignal;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  random?: () => number;
+}): Promise<void> {
+  const sleep = options.sleep ?? waitForGrabInterval;
+  const random = options.random ?? Math.random;
+  while (!options.signal.aborted) {
+    const delay = nextKeepaliveDelayMs(random);
+    await sleep(delay, options.signal);
+    if (options.signal.aborted) return;
+    const probe = buildAnyRouterKeepaliveProbe(
+      options.baseUrl,
+      options.model,
+      options.apiKey,
+      randomKeepaliveContent(random),
+      options.customHeaders,
+    );
+    if (!grabRequestHasCodexFingerprint(probe.header)) return;
+    try {
+      await managementApi.post('/api-call', {
+        method: 'POST',
+        url: probe.url,
+        header: probe.header,
+        data: probe.data,
+      }, { timeoutMs: PROVIDER_HEALTH_TIMEOUT_MS });
+    } catch {
+      // A failed ping does not drop the enabled provider. The next delay tries again.
+    }
+  }
 }

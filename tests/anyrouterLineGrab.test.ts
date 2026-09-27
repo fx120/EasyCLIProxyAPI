@@ -12,10 +12,17 @@ import {
   clampGrabIntervalMs,
   classifyGrabStatus,
   findOpenAiCompatibilityIndex,
+  ANYROUTER_KEEPALIVE_MAX_MS,
+  ANYROUTER_KEEPALIVE_MIN_MS,
+  buildAnyRouterKeepaliveProbe,
   formatGrabElapsed,
   grabRequestHasCodexFingerprint,
+  headersWithCodexFingerprint,
   isAnyRouterBaseUrl,
+  nextKeepaliveDelayMs,
+  randomKeepaliveContent,
   runAnyRouterGrabLoop,
+  runAnyRouterKeepalive,
 } from '../src/services/anyrouterLineGrab';
 
 const provider = {
@@ -132,11 +139,10 @@ describe('AnyRouter line grab', () => {
       url: 'https://anyrouter.top/v1/chat/completions',
     });
     expect(sleeps).toEqual([250]);
-    expect(patch).toHaveBeenCalledTimes(1);
-    expect(patch).toHaveBeenCalledWith('/openai-compatibility', {
-      index: 0,
-      value: { disabled: false },
-    });
+    expect(patch.mock.calls.map((call) => call[1])).toEqual([
+      { index: 0, value: { disabled: true } },
+      { index: 0, value: { disabled: false } },
+    ]);
     post.mockRestore();
     get.mockRestore();
     patch.mockRestore();
@@ -147,7 +153,8 @@ describe('AnyRouter line grab', () => {
       status_code: 401,
       body: { error: { message: '无效的令牌' } },
     } as never);
-    const patch = spyOn(managementApi, 'patch');
+    const get = spyOn(managementApi, 'get').mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
     const result = await runAnyRouterGrabLoop({
       ...grabTarget,
       intervalMs: 1_000,
@@ -158,8 +165,11 @@ describe('AnyRouter line grab', () => {
     expect(result.reason).toBe('auth');
     expect(result.status).toBe(401);
     expect(result.detail).toContain('无效的令牌');
-    expect(patch).not.toHaveBeenCalled();
+    expect(patch.mock.calls.map((call) => call[1])).toEqual([
+      { index: 0, value: { disabled: true } },
+    ]);
     post.mockRestore();
+    get.mockRestore();
     patch.mockRestore();
   });
 
@@ -198,7 +208,10 @@ describe('AnyRouter line grab', () => {
     expect(result).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
     expect(notices.some((detail) => detail.includes('当前 API 不支持所选模型'))).toBe(true);
     expect(post).toHaveBeenCalledTimes(2);
-    expect(patch).toHaveBeenCalledTimes(1);
+    expect(patch.mock.calls.map((call) => call[1])).toEqual([
+      { index: 0, value: { disabled: true } },
+      { index: 0, value: { disabled: false } },
+    ]);
     post.mockRestore();
     get.mockRestore();
     patch.mockRestore();
@@ -230,7 +243,7 @@ describe('AnyRouter line grab', () => {
     });
     expect(authResult).toMatchObject({ phase: 'stopped', reason: 'auth', status: 401 });
     expect(authResult.detail).toContain('无效的令牌');
-    expect(patch).not.toHaveBeenCalled();
+    expect(patch.mock.calls.map((call) => (call[1] as { value: { disabled: boolean } }).value.disabled)).toEqual([true]);
 
     post.mockResolvedValue({ status_code: 200, body: {} } as never);
     const success = await runAnyRouterGrabLoop({
@@ -241,7 +254,7 @@ describe('AnyRouter line grab', () => {
       sleep: async () => { throw new Error('should not wait'); },
     });
     expect(success).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
-    expect(patch).toHaveBeenCalledTimes(1);
+    expect(patch.mock.calls.filter((call) => (call[1] as { value: { disabled: boolean } }).value.disabled === false)).toHaveLength(1);
 
     let started = 0;
     let release!: () => void;
@@ -265,7 +278,7 @@ describe('AnyRouter line grab', () => {
     expect(started).toBe(ANYROUTER_GRAB_MAX_CONCURRENCY);
     release();
     await expect(capped).resolves.toMatchObject({ reason: 'auth', status: 401 });
-    expect(patch).toHaveBeenCalledTimes(1);
+    expect(patch.mock.calls.filter((call) => (call[1] as { value: { disabled: boolean } }).value.disabled === false)).toHaveLength(1);
 
     post.mockRestore();
     get.mockRestore();
@@ -311,7 +324,9 @@ describe('AnyRouter line grab', () => {
     controller.abort();
     const result = await pending;
     expect(result.attempts).toBe(3);
-    expect(patch).not.toHaveBeenCalled();
+    expect(patch.mock.calls.map((call) => call[1])).toEqual([
+      { index: 0, value: { disabled: true } },
+    ]);
     post.mockRestore();
     get.mockRestore();
     patch.mockRestore();
@@ -332,6 +347,8 @@ describe('AnyRouter line grab', () => {
 
   it('does not send another request after stop during the busy wait', async () => {
     const post = spyOn(managementApi, 'post').mockResolvedValue({ status_code: 500 } as never);
+    const get = spyOn(managementApi, 'get').mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
     const controller = new AbortController();
     const result = await runAnyRouterGrabLoop({
       ...grabTarget,
@@ -347,7 +364,109 @@ describe('AnyRouter line grab', () => {
     });
     expect(post).toHaveBeenCalledTimes(1);
     expect(result.reason).toBe('aborted');
+    expect(patch.mock.calls.map((call) => call[1])).toEqual([
+      { index: 0, value: { disabled: true } },
+    ]);
     post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
+  });
+
+  it('keeps the grabbed line alive with one small fingerprinted chat request', async () => {
+    expect(nextKeepaliveDelayMs(() => 0)).toBe(ANYROUTER_KEEPALIVE_MIN_MS);
+    expect(nextKeepaliveDelayMs(() => 1)).toBe(ANYROUTER_KEEPALIVE_MAX_MS);
+    expect(nextKeepaliveDelayMs(() => 0.5)).toBe(4 * 60 * 1000);
+    const content = randomKeepaliveContent(() => 0);
+    expect(content).not.toBe('hi');
+    const probe = buildAnyRouterKeepaliveProbe(
+      grabTarget.baseUrl,
+      grabTarget.model,
+      grabTarget.apiKey,
+      content,
+    );
+    expect(probe.url).toBe('https://anyrouter.top/v1/chat/completions');
+    expect(grabRequestHasCodexFingerprint(probe.header)).toBe(true);
+    expect(JSON.parse(probe.data)).toEqual({
+      model: grabTarget.model,
+      messages: [{ role: 'user', content }],
+      stream: true,
+    });
+
+    const post = spyOn(managementApi, 'post');
+    const delays: number[] = [];
+    let pulses = 0;
+    post.mockImplementation(async () => {
+      pulses += 1;
+      return { status_code: 200, body: {} } as never;
+    });
+    const controller = new AbortController();
+    const pending = runAnyRouterKeepalive({
+      ...grabTarget,
+      signal: controller.signal,
+      random: () => 0,
+      sleep: async (ms, signal) => {
+        delays.push(ms);
+        if (delays.length > 1 || signal.aborted) {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener('abort', () => resolve(), { once: true });
+          });
+        }
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pulses).toBe(1);
+    expect(delays[0]).toBe(ANYROUTER_KEEPALIVE_MIN_MS);
+    const body = JSON.parse(String(post.mock.calls[0]?.[1] && (post.mock.calls[0]?.[1] as { data: string }).data));
+    expect(body.messages[0].content).toBe(content);
+    expect(body.model).toBe(grabTarget.model);
+    controller.abort();
+    await pending;
+    expect(pulses).toBe(1);
+    post.mockRestore();
+  });
+
+  it('drops a CPA User-Agent so the outbound grab keeps the Codex fingerprint', async () => {
+    const cpaHeaders = {
+      'user-agent': 'cli-proxy-openai-compat',
+      'User-Agent': 'EasyCLIProxyAPI/0.3.6 (+https://github.com/router-for-me/EasyCLIProxyAPI)',
+      Originator: 'CLIProxyAPI',
+      'openai-beta': 'cpa',
+      Accept: 'text/event-stream',
+      'X-Extra': 'keep',
+    };
+    const built = headersWithCodexFingerprint(cpaHeaders);
+    expect(JSON.stringify(built)).not.toMatch(/cli-proxy-openai-compat|EasyCLIProxyAPI|CPA-GUI|Go-http-client|\$User-Agent|CLIProxyAPI/);
+    expect(grabRequestHasCodexFingerprint(built)).toBe(true);
+    expect(built['X-Extra']).toBe('keep');
+    expect(Object.keys(built).filter((key) => key.toLowerCase() === 'user-agent')).toEqual(['User-Agent']);
+
+    const post = spyOn(managementApi, 'post').mockResolvedValue({
+      status_code: 401,
+      body: { error: { message: '无效的令牌' } },
+    } as never);
+    const get = spyOn(managementApi, 'get').mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
+    const result = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      customHeaders: cpaHeaders,
+      intervalMs: 1_000,
+      signal: new AbortController().signal,
+      sleep: async () => { throw new Error('should not wait'); },
+    });
+    const header = (post.mock.calls[0]?.[1] as { header: Record<string, string> }).header;
+    const packed = JSON.stringify(header);
+    expect(packed).not.toMatch(/cli-proxy-openai-compat|EasyCLIProxyAPI|CPA-GUI|Go-http-client|\$User-Agent|CLIProxyAPI/);
+    expect(grabRequestHasCodexFingerprint(header)).toBe(true);
+    expect(header['User-Agent']).toBe(CODEX_CLIENT_FINGERPRINT_HEADERS['User-Agent']);
+    expect(header['OpenAI-Beta']).toBe('codex-1');
+    expect(header.Originator).toBe('Codex Desktop');
+    expect(header.Accept).toBe('application/json');
+    expect(header['X-Extra']).toBe('keep');
+    expect(result.reason).toBe('auth');
+    post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
   });
 
   it('finds the saved provider by name, base URL, and key', () => {

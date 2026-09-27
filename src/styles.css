@@ -5106,7 +5106,8 @@ textarea:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
-.provider-grab-activity.running {
+.provider-grab-activity.running,
+.provider-grab-activity.keepalive {
   color: var(--theme-2d2a26);
   font-weight: var(--font-weight-medium);
 }
