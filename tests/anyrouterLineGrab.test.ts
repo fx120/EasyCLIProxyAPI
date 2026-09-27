@@ -12,6 +12,7 @@ import {
   clampGrabIntervalMs,
   classifyGrabStatus,
   findOpenAiCompatibilityIndex,
+  formatGrabElapsed,
   grabRequestHasCodexFingerprint,
   isAnyRouterBaseUrl,
   runAnyRouterGrabLoop,
@@ -88,6 +89,10 @@ describe('AnyRouter line grab', () => {
     expect(clampGrabConcurrency(4.2)).toBe(4);
     expect(clampGrabConcurrency(100)).toBe(ANYROUTER_GRAB_MAX_CONCURRENCY);
     expect(clampGrabConcurrency(Number.NaN)).toBe(1);
+    expect(formatGrabElapsed(0)).toBe('0:00');
+    expect(formatGrabElapsed(1_500)).toBe('0:01');
+    expect(formatGrabElapsed(65_000)).toBe('1:05');
+    expect(formatGrabElapsed(3_661_000)).toBe('1:01:01');
   });
 
   it('enables the matching OpenAI-compatible entry after 200 and does not request again', async () => {
@@ -113,7 +118,7 @@ describe('AnyRouter line grab', () => {
     });
 
     const probe = buildAnyRouterGrabProbe(grabTarget.baseUrl, grabTarget.model, grabTarget.apiKey);
-    expect(result).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
+    expect(result).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success', attempts: 2 });
     expect(post).toHaveBeenCalledTimes(2);
     expect(post.mock.calls[0]?.[0]).toBe('/api-call');
     expect(post.mock.calls[0]?.[1]).toEqual({
@@ -262,6 +267,51 @@ describe('AnyRouter line grab', () => {
     await expect(capped).resolves.toMatchObject({ reason: 'auth', status: 401 });
     expect(patch).toHaveBeenCalledTimes(1);
 
+    post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
+  });
+
+  it('counts one attempt for every in-flight probe across threads', async () => {
+    const post = spyOn(managementApi, 'post');
+    const get = spyOn(managementApi, 'get');
+    const patch = spyOn(managementApi, 'patch');
+    get.mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    patch.mockResolvedValue({} as never);
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const opened = new Promise<void>((resolve) => {
+      post.mockImplementation(async () => {
+        started += 1;
+        if (started === 3) resolve();
+        await gate;
+        return { status_code: 404, body: { error: { message: '当前 API 不支持所选模型' } } } as never;
+      });
+    });
+    const seen: number[] = [];
+    const controller = new AbortController();
+    const pending = runAnyRouterGrabLoop({
+      ...grabTarget,
+      concurrency: 3,
+      intervalMs: 50,
+      signal: controller.signal,
+      onAttempt: (attempts) => { seen.push(attempts); },
+      sleep: async (_ms, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    });
+    await opened;
+    expect(started).toBe(3);
+    expect(seen).toEqual([1, 2, 3]);
+    release();
+    controller.abort();
+    const result = await pending;
+    expect(result.attempts).toBe(3);
+    expect(patch).not.toHaveBeenCalled();
     post.mockRestore();
     get.mockRestore();
     patch.mockRestore();

@@ -1,22 +1,28 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { useI18n } from '../i18n';
 import type { MessageKey, MessageVariables } from '../i18n/resources';
+import {
+  getGrabSession,
+  patchGrabSessionConfig,
+  resumeGrabSessionIfNeeded,
+  startGrabSession,
+  stopGrabSession,
+  subscribeGrabSessions,
+  subscribeGrabSuccess,
+  anyRouterGrabSessionKey,
+  type GrabSessionSnapshot,
+  type GrabSessionTarget,
+} from '../services/anyrouterGrabSession';
 import {
   ANYROUTER_GRAB_DEFAULT_CONCURRENCY,
   ANYROUTER_GRAB_DEFAULT_INTERVAL_MS,
   ANYROUTER_GRAB_MAX_CONCURRENCY,
   ANYROUTER_GRAB_MIN_INTERVAL_MS,
-  runAnyRouterGrabLoop,
-  type GrabLoopResult,
-  type GrabStatusUpdate,
+  formatGrabElapsed,
 } from '../services/anyrouterLineGrab';
 
-type ProviderTarget = {
-  providerName: string;
-  baseUrl: string;
-  apiKey: string;
+type ProviderTarget = GrabSessionTarget & {
   models: string[];
-  customHeaders?: Record<string, string>;
 };
 
 export function AnyRouterGrabControls({
@@ -27,106 +33,72 @@ export function AnyRouterGrabControls({
   onEnabled: () => Promise<void> | void;
 }) {
   const { t } = useI18n();
-  const [intervalMs, setIntervalMs] = useState(ANYROUTER_GRAB_DEFAULT_INTERVAL_MS);
-  const [threads, setThreads] = useState(ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
-  const [selectedModel, setSelectedModel] = useState('');
+  const key = anyRouterGrabSessionKey(target.providerName, target.baseUrl, target.apiKey);
+  const session = useSyncExternalStore(
+    subscribeGrabSessions,
+    () => getGrabSession(key),
+    () => getGrabSession(key),
+  );
   const modelList = target.models.filter((model) => model.trim()).join('\0');
-  const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState<number | null>(null);
-  const [result, setResult] = useState<GrabLoopResult | null>(null);
-  const [notice, setNotice] = useState<GrabLoopResult | null>(null);
-  const [busyNote, setBusyNote] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const [missingModel, setMissingModel] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => {
+    return subscribeGrabSuccess(() => {
+      void onEnabled();
+    });
+  }, [onEnabled]);
+
+  useEffect(() => {
+    resumeGrabSessionIfNeeded(key, {
+      providerName: target.providerName,
+      baseUrl: target.baseUrl,
+      apiKey: target.apiKey,
+      customHeaders: target.customHeaders,
+    });
+  }, [key, target.providerName, target.baseUrl, target.apiKey, target.customHeaders]);
 
   useEffect(() => {
     const names = modelList ? modelList.split('\0') : [];
-    setSelectedModel((current) => (current && names.includes(current) ? current : ''));
-  }, [modelList]);
+    if (names.length === 0) return;
+    const current = getGrabSession(key);
+    if (current.running || !current.model || names.includes(current.model)) return;
+    patchGrabSessionConfig(key, { model: '' });
+  }, [key, modelList]);
 
-  const applyUpdate = (update: GrabStatusUpdate) => {
-    setStatus(update.status);
-    const busy = update.phase === 'running' && update.reason === 'busy';
-    setBusyNote(busy);
-    if (update.phase === 'running') {
-      setNotice(busy || update.reason === 'busy' ? null : {
-        phase: 'stopped',
-        status: update.status,
-        reason: update.reason,
-        detail: update.detail,
-      });
-      return;
-    }
-    setRunning(false);
-    setNotice(null);
-    setResult({
-      phase: update.phase === 'succeeded' ? 'succeeded' : 'stopped',
-      status: update.status,
-      reason: update.reason === 'busy' ? 'aborted' : update.reason,
-      detail: update.detail,
-    });
-  };
+  useEffect(() => {
+    if (!session.running || session.startedAt == null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 200);
+    return () => window.clearInterval(timer);
+  }, [session.running, session.startedAt]);
+
+  const elapsedMs = session.running && session.startedAt != null
+    ? Math.max(0, now - session.startedAt)
+    : session.elapsedMs;
+  const statusLabel = session.status === null ? '—' : String(session.status);
+  const message = describeGrab(session, missingModel, t);
 
   const start = () => {
-    const model = selectedModel.trim();
-    if (!model) {
-      setResult({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
-      setNotice(null);
-      setBusyNote(false);
+    if (!session.model.trim()) {
+      setMissingModel(true);
       return;
     }
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setRunning(true);
-    setResult(null);
-    setNotice(null);
-    setBusyNote(false);
-    setStatus(null);
-    void runAnyRouterGrabLoop({
-      baseUrl: target.baseUrl,
-      apiKey: target.apiKey,
-      providerName: target.providerName,
-      model,
-      customHeaders: target.customHeaders,
-      intervalMs,
-      concurrency: threads,
-      signal: controller.signal,
-      onStatus: (update) => {
-        if (abortRef.current !== controller) return;
-        applyUpdate(update);
-        if (update.reason === 'success') void onEnabled();
-      },
-    }).then((finalResult) => {
-      if (abortRef.current !== controller) return;
-      setRunning(false);
-      setStatus(finalResult.status);
-      setBusyNote(false);
-      if (finalResult.reason !== 'aborted') setResult(finalResult);
-    });
+    setMissingModel(false);
+    startGrabSession(key, target, session.model);
   };
-
-  const stop = () => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-      setRunning(false);
-      setBusyNote(false);
-      setNotice(null);
-      setResult({ phase: 'stopped', status, reason: 'aborted', detail: '' });
-  };
-
-  const statusLabel = status === null ? '—' : String(status);
-  const message = describeGrab(result ?? notice, busyNote, t);
 
   return (
     <div className="provider-grab-panel">
       <label>
         <span>{t('apiAccess.grab.model')}</span>
         <select
-          value={selectedModel}
-          disabled={running}
-          onChange={(event) => setSelectedModel(event.currentTarget.value)}
+          value={session.model}
+          disabled={session.running}
+          onChange={(event) => {
+            setMissingModel(false);
+            patchGrabSessionConfig(key, { model: event.currentTarget.value });
+          }}
         >
           <option value="">{t('apiAccess.grab.modelPlaceholder')}</option>
           {target.models.map((model) => (
@@ -140,11 +112,13 @@ export function AnyRouterGrabControls({
           type="number"
           min={ANYROUTER_GRAB_MIN_INTERVAL_MS}
           step={50}
-          value={intervalMs}
-          disabled={running}
+          value={session.intervalMs}
+          disabled={session.running}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);
-            setIntervalMs(Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_INTERVAL_MS);
+            patchGrabSessionConfig(key, {
+              intervalMs: Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_INTERVAL_MS,
+            });
           }}
         />
       </label>
@@ -155,16 +129,18 @@ export function AnyRouterGrabControls({
           min={1}
           max={ANYROUTER_GRAB_MAX_CONCURRENCY}
           step={1}
-          value={threads}
-          disabled={running}
+          value={session.threads}
+          disabled={session.running}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);
-            setThreads(Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
+            patchGrabSessionConfig(key, {
+              threads: Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_CONCURRENCY,
+            });
           }}
         />
       </label>
-      {running ? (
-        <button type="button" className="secondary-button compact-button" onClick={stop}>
+      {session.running ? (
+        <button type="button" className="secondary-button compact-button" onClick={() => stopGrabSession(key)}>
           {t('apiAccess.grab.stop')}
         </button>
       ) : (
@@ -172,6 +148,13 @@ export function AnyRouterGrabControls({
           {t('apiAccess.grab.start')}
         </button>
       )}
+      {session.active ? (
+        <span className={`provider-grab-activity ${session.running ? 'running' : 'stopped'}`}>
+          <span>{session.running ? t('apiAccess.grab.running') : t('apiAccess.grab.stopped')}</span>
+          <span>{t('apiAccess.grab.elapsed', { time: formatGrabElapsed(elapsedMs) })}</span>
+          <span>{t('apiAccess.grab.attempts', { count: session.attempts })}</span>
+        </span>
+      ) : null}
       <span className="provider-grab-status">{t('apiAccess.grab.lastStatus', { status: statusLabel })}</span>
       {message ? <span className="provider-grab-message">{message}</span> : null}
     </div>
@@ -179,22 +162,32 @@ export function AnyRouterGrabControls({
 }
 
 function describeGrab(
-  result: GrabLoopResult | null,
-  busy: boolean,
+  session: GrabSessionSnapshot,
+  missingModel: boolean,
   t: (key: MessageKey, variables?: MessageVariables) => string,
 ) {
-  if (busy) return t('apiAccess.grab.busy');
-  if (!result || result.reason === 'aborted') {
-    return result?.reason === 'aborted' ? t('apiAccess.grab.stopped') : '';
+  if (missingModel && !session.model.trim()) return t('apiAccess.grab.missingModel');
+  if (!session.active && !session.running) return '';
+  if (session.running) {
+    if (session.reason === 'busy') return t('apiAccess.grab.busy');
+    if (session.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: session.detail });
+    if (session.status != null && session.detail) {
+      return t('apiAccess.grab.continuing', { status: session.status, reason: session.detail });
+    }
+    return '';
   }
-  if (result.reason === 'success') return t('apiAccess.grab.success');
-  if (result.reason === 'missing-key') return t('apiAccess.grab.missingKey');
-  if (result.reason === 'missing-url') return t('apiAccess.grab.missingUrl');
-  if (result.reason === 'missing-model') return t('apiAccess.grab.missingModel');
-  if (result.reason === 'missing-fingerprint') return t('apiAccess.grab.missingFingerprint');
-  if (result.reason === 'enable-failed') return t('apiAccess.grab.enableFailed', { reason: result.detail });
-  if (result.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: result.detail });
-  const status = result.status ?? '—';
-  if (result.reason === 'auth') return t('apiAccess.grab.authFailed', { status, reason: result.detail });
-  return t('apiAccess.grab.failed', { status, reason: result.detail });
+  if (session.reason === 'success') return t('apiAccess.grab.success');
+  if (session.reason === 'missing-key') return t('apiAccess.grab.missingKey');
+  if (session.reason === 'missing-url') return t('apiAccess.grab.missingUrl');
+  if (session.reason === 'missing-model') return t('apiAccess.grab.missingModel');
+  if (session.reason === 'missing-fingerprint') return t('apiAccess.grab.missingFingerprint');
+  if (session.reason === 'enable-failed') return t('apiAccess.grab.enableFailed', { reason: session.detail });
+  if (session.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: session.detail });
+  if (session.reason === 'auth') {
+    return t('apiAccess.grab.authFailed', { status: session.status ?? '—', reason: session.detail });
+  }
+  if (session.reason === 'other') {
+    return t('apiAccess.grab.failed', { status: session.status ?? '—', reason: session.detail });
+  }
+  return '';
 }

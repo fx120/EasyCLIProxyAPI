@@ -54,6 +54,7 @@ export type GrabStatusUpdate = {
   status: number | null;
   reason: GrabStopReason | 'busy';
   detail: string;
+  attempts: number;
 };
 
 export type GrabLoopResult = {
@@ -61,7 +62,18 @@ export type GrabLoopResult = {
   status: number | null;
   reason: GrabStopReason;
   detail: string;
+  attempts: number;
 };
+
+export function formatGrabElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  if (hours > 0) return `${hours}:${pad(minutes)}:${pad(seconds)}`;
+  return `${minutes}:${pad(seconds)}`;
+}
 
 const headerValue = (headers: Record<string, string>, name: string) =>
   Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ?? '';
@@ -215,28 +227,36 @@ export async function runAnyRouterGrabLoop(options: {
   concurrency?: number;
   signal: AbortSignal;
   onStatus?: (update: GrabStatusUpdate) => void;
+  onAttempt?: (attempts: number) => void;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }): Promise<GrabLoopResult> {
   const sleep = options.sleep ?? waitForGrabInterval;
   const publish = (result: GrabLoopResult): GrabLoopResult => {
     if (options.signal.aborted && result.reason !== 'success') {
-      return { phase: 'stopped', status: result.status, reason: 'aborted', detail: '' };
+      return {
+        phase: 'stopped',
+        status: result.status,
+        reason: 'aborted',
+        detail: result.detail,
+        attempts: result.attempts,
+      };
     }
     options.onStatus?.({
       phase: result.phase === 'succeeded' ? 'succeeded' : 'stopped',
       status: result.status,
       reason: result.reason,
       detail: result.detail,
+      attempts: result.attempts,
     });
     return result;
   };
 
   const apiKey = options.apiKey.trim();
   if (!apiKey) {
-    return publish({ phase: 'stopped', status: null, reason: 'missing-key', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-key', detail: '', attempts: 0 });
   }
   if (!options.baseUrl.trim()) {
-    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '', attempts: 0 });
   }
 
   let probe;
@@ -245,20 +265,21 @@ export async function runAnyRouterGrabLoop(options: {
   } catch (error) {
     const message = errorText(error);
     if (message === 'missing model') {
-      return publish({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
+      return publish({ phase: 'stopped', status: null, reason: 'missing-model', detail: '', attempts: 0 });
     }
     return publish({
       phase: 'stopped',
       status: null,
       reason: 'missing-url',
       detail: message === 'missing base url' ? '' : message,
+      attempts: 0,
     });
   }
   if (!probe.url) {
-    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '', attempts: 0 });
   }
   if (!grabRequestHasCodexFingerprint(probe.header)) {
-    return publish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '', attempts: 0 });
   }
 
   const intervalMs = clampGrabIntervalMs(options.intervalMs);
@@ -268,9 +289,15 @@ export async function runAnyRouterGrabLoop(options: {
   if (options.signal.aborted) stopAll.abort();
   else options.signal.addEventListener('abort', abortStopAll, { once: true });
 
-  const gate: { claimed: boolean; terminal: GrabLoopResult | null } = {
+  const gate: { claimed: boolean; terminal: GrabLoopResult | null; attempts: number } = {
     claimed: false,
     terminal: null,
+    attempts: 0,
+  };
+  const countAttempt = () => {
+    gate.attempts += 1;
+    options.onAttempt?.(gate.attempts);
+    return gate.attempts;
   };
   const claim = () => {
     if (gate.claimed || options.signal.aborted) return false;
@@ -286,6 +313,8 @@ export async function runAnyRouterGrabLoop(options: {
   const worker = async () => {
     while (!options.signal.aborted && !gate.claimed) {
       let response: Record<string, unknown>;
+      if (options.signal.aborted || gate.claimed) return;
+      const attempts = countAttempt();
       try {
         response = await managementApi.post<Record<string, unknown>>('/api-call', {
           method: 'POST',
@@ -300,6 +329,7 @@ export async function runAnyRouterGrabLoop(options: {
           status: null,
           reason: 'request-failed',
           detail: errorText(error),
+          attempts,
         });
         await sleep(intervalMs, stopAll.signal);
         continue;
@@ -309,7 +339,7 @@ export async function runAnyRouterGrabLoop(options: {
       const status = readGrabStatusCode(response);
       const decision = classifyGrabStatus(status, grabRequestHasCodexFingerprint(probe.header));
       if (decision.action === 'retry') {
-        noteRunning({ phase: 'running', status, reason: 'busy', detail: '' });
+        noteRunning({ phase: 'running', status, reason: 'busy', detail: '', attempts });
         await sleep(intervalMs, stopAll.signal);
         continue;
       }
@@ -319,6 +349,7 @@ export async function runAnyRouterGrabLoop(options: {
           status,
           reason: 'other',
           detail: apiCallErrorMessage(response),
+          attempts,
         });
         await sleep(intervalMs, stopAll.signal);
         continue;
@@ -331,13 +362,14 @@ export async function runAnyRouterGrabLoop(options: {
             baseUrl: options.baseUrl,
             apiKey,
           });
-          gate.terminal = { phase: 'succeeded', status, reason: 'success', detail: '' };
+          gate.terminal = { phase: 'succeeded', status, reason: 'success', detail: '', attempts };
         } catch (error) {
           gate.terminal = {
             phase: 'stopped',
             status,
             reason: 'enable-failed',
             detail: errorText(error),
+            attempts,
           };
         }
         return;
@@ -347,6 +379,7 @@ export async function runAnyRouterGrabLoop(options: {
         status,
         reason: decision.reason,
         detail: apiCallErrorMessage(response),
+        attempts,
       };
     }
   };
@@ -361,5 +394,11 @@ export async function runAnyRouterGrabLoop(options: {
   if (terminal?.reason === 'success' || (terminal && !options.signal.aborted)) {
     return publish(terminal);
   }
-  return { phase: 'stopped', status: terminal?.status ?? null, reason: 'aborted', detail: '' };
+  return {
+    phase: 'stopped',
+    status: terminal?.status ?? null,
+    reason: 'aborted',
+    detail: terminal?.detail ?? '',
+    attempts: gate.attempts,
+  };
 }
