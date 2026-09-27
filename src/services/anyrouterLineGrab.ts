@@ -119,7 +119,11 @@ export function headersWithCodexFingerprint(
   return { ...kept, ...codexClientFingerprintHeaders() };
 }
 
-/** Chat-completions probe 健康检测 already builds for an OpenAI-compatible base. */
+/**
+ * Codex responses probe 健康检测 already builds for provider `codex`.
+ * The selected model is sent unchanged. CPA `/requests/api-call` forwards
+ * this URL and JSON body as-is.
+ */
 export function buildAnyRouterGrabProbe(
   baseUrl: string,
   model: string,
@@ -129,7 +133,7 @@ export function buildAnyRouterGrabProbe(
   if (!baseUrl.trim()) throw new Error('missing base url');
   if (!model.trim()) throw new Error('missing model');
   return buildProviderHealthProbe(
-    'openai',
+    'codex',
     baseUrl,
     model,
     apiKey,
@@ -138,7 +142,7 @@ export function buildAnyRouterGrabProbe(
   );
 }
 
-/** Same chat probe as a grab, with a short random user message. */
+/** Same Codex responses probe as a grab, with a short random `input`. */
 export function buildAnyRouterKeepaliveProbe(
   baseUrl: string,
   model: string,
@@ -151,10 +155,10 @@ export function buildAnyRouterKeepaliveProbe(
   const probe = buildAnyRouterGrabProbe(baseUrl, model, apiKey, customHeaders);
   const body = JSON.parse(probe.data) as {
     model: string;
-    messages: Array<{ role: string; content: string }>;
+    input: string;
     stream: boolean;
   };
-  body.messages = [{ role: 'user', content: message }];
+  body.input = message;
   return { ...probe, data: JSON.stringify(body) };
 }
 

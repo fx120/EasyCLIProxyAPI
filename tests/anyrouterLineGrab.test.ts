@@ -40,7 +40,7 @@ const grabTarget = {
 };
 
 describe('AnyRouter line grab', () => {
-  it('uses the health-check chat completions probe and the Codex fingerprint', () => {
+  it('uses the Codex responses probe and the Codex fingerprint', () => {
     expect(isAnyRouterBaseUrl('https://anyrouter.top/v1')).toBe(true);
     expect(isAnyRouterBaseUrl('https://api.example.com/v1')).toBe(false);
     expect(anyRouterGrabModels([
@@ -58,20 +58,21 @@ describe('AnyRouter line grab', () => {
       'sk-test-key',
     );
     expect(probe).toEqual(buildProviderHealthProbe(
-      'openai',
+      'codex',
       'https://anyrouter.top/v1',
       'claude-sonnet-4-20250514',
       'sk-test-key',
       '',
       codexClientFingerprintHeaders(),
     ));
-    expect(probe.url).toBe('https://anyrouter.top/v1/chat/completions');
-    expect(probe.protocol).toBe('openai-chat');
+    expect(probe.url).toBe('https://anyrouter.top/v1/responses');
+    expect(probe.protocol).toBe('openai-responses');
     expect(JSON.parse(probe.data)).toEqual({
       model: 'claude-sonnet-4-20250514',
-      messages: [{ role: 'user', content: 'hi' }],
+      input: 'hi',
       stream: true,
     });
+    expect(JSON.parse(probe.data).messages).toBeUndefined();
     expect(grabRequestHasCodexFingerprint(probe.header)).toBe(true);
     expect(probe.header).toMatchObject({
       ...CODEX_CLIENT_FINGERPRINT_HEADERS,
@@ -130,13 +131,18 @@ describe('AnyRouter line grab', () => {
     expect(post.mock.calls[0]?.[0]).toBe('/api-call');
     expect(post.mock.calls[0]?.[1]).toEqual({
       method: 'POST',
-      url: 'https://anyrouter.top/v1/chat/completions',
+      url: 'https://anyrouter.top/v1/responses',
       header: probe.header,
       data: probe.data,
     });
+    expect(JSON.parse(String((post.mock.calls[0]?.[1] as { data: string }).data))).toEqual({
+      model: grabTarget.model,
+      input: 'hi',
+      stream: true,
+    });
     expect(post.mock.calls[1]?.[1]).toMatchObject({
       method: 'POST',
-      url: 'https://anyrouter.top/v1/chat/completions',
+      url: 'https://anyrouter.top/v1/responses',
     });
     expect(sleeps).toEqual([250]);
     expect(patch.mock.calls.map((call) => call[1])).toEqual([
@@ -372,7 +378,7 @@ describe('AnyRouter line grab', () => {
     patch.mockRestore();
   });
 
-  it('keeps the grabbed line alive with one small fingerprinted chat request', async () => {
+  it('keeps the grabbed line alive with one small fingerprinted Codex responses request', async () => {
     expect(nextKeepaliveDelayMs(() => 0)).toBe(ANYROUTER_KEEPALIVE_MIN_MS);
     expect(nextKeepaliveDelayMs(() => 1)).toBe(ANYROUTER_KEEPALIVE_MAX_MS);
     expect(nextKeepaliveDelayMs(() => 0.5)).toBe(4 * 60 * 1000);
@@ -384,11 +390,11 @@ describe('AnyRouter line grab', () => {
       grabTarget.apiKey,
       content,
     );
-    expect(probe.url).toBe('https://anyrouter.top/v1/chat/completions');
+    expect(probe.url).toBe('https://anyrouter.top/v1/responses');
     expect(grabRequestHasCodexFingerprint(probe.header)).toBe(true);
     expect(JSON.parse(probe.data)).toEqual({
       model: grabTarget.model,
-      messages: [{ role: 'user', content }],
+      input: content,
       stream: true,
     });
 
@@ -418,8 +424,8 @@ describe('AnyRouter line grab', () => {
     expect(pulses).toBe(1);
     expect(delays[0]).toBe(ANYROUTER_KEEPALIVE_MIN_MS);
     const body = JSON.parse(String(post.mock.calls[0]?.[1] && (post.mock.calls[0]?.[1] as { data: string }).data));
-    expect(body.messages[0].content).toBe(content);
-    expect(body.model).toBe(grabTarget.model);
+    expect(body).toEqual({ model: grabTarget.model, input: content, stream: true });
+    expect(body.messages).toBeUndefined();
     controller.abort();
     await pending;
     expect(pulses).toBe(1);
@@ -464,6 +470,68 @@ describe('AnyRouter line grab', () => {
     expect(header.Accept).toBe('application/json');
     expect(header['X-Extra']).toBe('keep');
     expect(result.reason).toBe('auth');
+    post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
+  });
+
+  it('posts the full Codex responses body for the selected model', async () => {
+    const post = spyOn(managementApi, 'post').mockResolvedValue({
+      status_code: 404,
+      body: '当前 API 不支持所选模型 gpt-6-astra',
+    } as never);
+    const get = spyOn(managementApi, 'get').mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    const patch = spyOn(managementApi, 'patch').mockResolvedValue({} as never);
+    const controller = new AbortController();
+    const result = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      model: 'gpt-6-astra',
+      customHeaders: {
+        'user-agent': 'cli-proxy-openai-compat',
+        Accept: 'text/event-stream',
+        'openai-beta': 'cpa',
+        Originator: 'CLIProxyAPI',
+      },
+      intervalMs: 1_000,
+      signal: controller.signal,
+      onStatus: (update) => {
+        if (update.status === 404) controller.abort();
+      },
+      sleep: async (_ms, signal) => {
+        if (signal.aborted) return;
+        throw new Error('wait should observe the abort');
+      },
+    });
+
+    expect(post).toHaveBeenCalledTimes(1);
+    const payload = post.mock.calls[0]?.[1] as {
+      method: string;
+      url: string;
+      header: Record<string, string>;
+      data: string;
+    };
+    expect(payload).toEqual({
+      method: 'POST',
+      url: 'https://anyrouter.top/v1/responses',
+      header: {
+        ...CODEX_CLIENT_FINGERPRINT_HEADERS,
+        Authorization: 'Bearer sk-test-key',
+      },
+      data: JSON.stringify({
+        model: 'gpt-6-astra',
+        input: 'hi',
+        stream: true,
+      }),
+    });
+    expect(payload.url).not.toContain('chat/completions');
+    expect(payload.header['Session-Id']).toBeUndefined();
+    expect(payload.header.session_id).toBeUndefined();
+    expect(JSON.parse(payload.data)).toEqual({
+      model: 'gpt-6-astra',
+      input: 'hi',
+      stream: true,
+    });
+    expect(result).toMatchObject({ reason: 'aborted', attempts: 1 });
     post.mockRestore();
     get.mockRestore();
     patch.mockRestore();
