@@ -5067,6 +5067,60 @@ textarea:focus-visible {
   gap: 7px;
 }
 
+.provider-grab-panel {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--theme-e8e4dc);
+  border-radius: 8px;
+  background: var(--theme-faf9f5);
+  color: var(--theme-2d2a26);
+  font-size: var(--font-size-meta);
+}
+
+.provider-grab-panel label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.provider-grab-panel input[type='number'] {
+  width: 88px;
+  min-height: 30px;
+}
+
+.provider-grab-panel select {
+  min-width: 180px;
+  max-width: 280px;
+  min-height: 30px;
+}
+
+.provider-grab-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.provider-grab-activity.running,
+.provider-grab-activity.keepalive {
+  color: var(--theme-2d2a26);
+  font-weight: var(--font-weight-medium);
+}
+
+.provider-grab-activity.stopped {
+  color: var(--theme-7a746c);
+}
+
+.provider-grab-status,
+.provider-grab-message {
+  color: var(--theme-7a746c);
+}
+
 .provider-row-actions .provider-health-button {
   min-width: max-content;
   width: auto;

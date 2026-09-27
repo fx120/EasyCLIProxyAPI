@@ -78,6 +78,8 @@ import { normalizeProviderProxyUrl } from '../services/providerProxy';
 import { getCurrentLocale, translate, useI18n } from '../i18n';
 import type { MessageKey } from '../i18n/resources';
 import { MessageNotice, FloatingNotice, useAppNotice } from '../appNotice';
+import { AnyRouterGrabControls } from '../components/AnyRouterGrabControls';
+import { anyRouterGrabModels, isAnyRouterBaseUrl } from '../services/anyrouterLineGrab';
 
 export type ProviderSection =
   | 'gemini-api-key'
@@ -1521,6 +1523,18 @@ export function ApiAccessPage() {
                       <Trash2 size={16} aria-hidden="true" />
                     </button>
                   </div>
+                  {row.section === 'openai-compatibility' && isAnyRouterBaseUrl(row.baseUrl) ? (
+                    <AnyRouterGrabControls
+                      target={{
+                        providerName: readString(row.record, 'name'),
+                        baseUrl: row.baseUrl,
+                        apiKey: row.apiKey,
+                        models: anyRouterGrabModels(row.models),
+                        customHeaders: providerHeadersFromRecord(row.record),
+                      }}
+                      onEnabled={() => loadProviders(false)}
+                    />
+                  ) : null}
                     </SortableProviderRow>
                   ))}
                 </div>

@@ -63,6 +63,26 @@ const CODEX_RESET_CREDITS_CONSUME_URL =
 const ANTIGRAVITY_CODE_ASSIST_URL =
   'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist';
 
+/** User-Agent this app already sends on Codex quota requests. */
+export const CODEX_CLIENT_USER_AGENT =
+  'codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)';
+
+/**
+ * Static Codex client identity already sent with reset-credit requests:
+ * User-Agent, OpenAI-Beta, and Originator. Credential headers are separate.
+ */
+export const CODEX_CLIENT_FINGERPRINT_HEADERS = {
+  'User-Agent': CODEX_CLIENT_USER_AGENT,
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+  'OpenAI-Beta': 'codex-1',
+  Originator: 'Codex Desktop',
+} as const;
+
+export function codexClientFingerprintHeaders(): Record<string, string> {
+  return { ...CODEX_CLIENT_FINGERPRINT_HEADERS };
+}
+
 const headersByProvider: Record<QuotaProvider, Record<string, string>> = {
   devin: DEVIN_QUOTA_HEADERS,
   claude: {
@@ -73,7 +93,7 @@ const headersByProvider: Record<QuotaProvider, Record<string, string>> = {
   codex: {
     Authorization: 'Bearer $TOKEN$',
     'Content-Type': 'application/json',
-    'User-Agent': 'codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)',
+    'User-Agent': CODEX_CLIENT_USER_AGENT,
   },
   kimi: { Authorization: 'Bearer $TOKEN$' },
   xai: {
@@ -823,10 +843,8 @@ const callCodexResetCredits = async (
   const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
   if (!authIndex) throw new Error(quotaText('quota.service.error.missingResetAuthIndex'));
   const header: Record<string, string> = {
-    ...headersByProvider.codex,
-    Accept: 'application/json',
-    'OpenAI-Beta': 'codex-1',
-    Originator: 'Codex Desktop',
+    ...codexClientFingerprintHeaders(),
+    Authorization: 'Bearer $TOKEN$',
   };
   if (accountId) header['Chatgpt-Account-Id'] = accountId;
   const payload = await requestQuotaPayload(authIndex, CODEX_RESET_CREDITS_URL, header, 'GET', undefined, 8_000);
