@@ -6,7 +6,7 @@ import {
   ANYROUTER_GRAB_MAX_CONCURRENCY,
   ANYROUTER_GRAB_MIN_INTERVAL_MS,
   anyRouterGrabHeaders,
-  anyRouterGrabModel,
+  anyRouterGrabModels,
   buildAnyRouterGrabProbe,
   clampGrabConcurrency,
   clampGrabIntervalMs,
@@ -35,11 +35,15 @@ describe('AnyRouter line grab', () => {
   it('uses the health-check chat completions probe and the Codex fingerprint', () => {
     expect(isAnyRouterBaseUrl('https://anyrouter.top/v1')).toBe(true);
     expect(isAnyRouterBaseUrl('https://api.example.com/v1')).toBe(false);
-    expect(anyRouterGrabModel([
+    expect(anyRouterGrabModels([
       { name: 'gpt-5-codex' },
       { name: 'claude-sonnet-4-20250514' },
       { name: 'gemini-2.5-pro' },
-    ])).toBe('claude-sonnet-4-20250514');
+    ])).toEqual([
+      'claude-sonnet-4-20250514',
+      'gemini-2.5-pro',
+      'gpt-5-codex',
+    ]);
     const probe = buildAnyRouterGrabProbe(
       'https://anyrouter.top/v1',
       'claude-sonnet-4-20250514',

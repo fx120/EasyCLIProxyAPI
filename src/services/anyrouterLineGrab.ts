@@ -77,9 +77,11 @@ export function isAnyRouterBaseUrl(baseUrl: string): boolean {
   }
 }
 
-/** First model name from the same list 健康检测 starts with. */
-export function anyRouterGrabModel(models: ModelOption[]): string {
-  return mergeProviderHealthModels([], models)[0]?.name.trim() ?? '';
+/** Configured model names 健康检测 already lists for this provider. Nothing is chosen. */
+export function anyRouterGrabModels(models: ModelOption[]): string[] {
+  return mergeProviderHealthModels([], models)
+    .map((model) => model.name.trim())
+    .filter(Boolean);
 }
 
 /** Chat-completions probe 健康检测 already builds for an OpenAI-compatible base. */

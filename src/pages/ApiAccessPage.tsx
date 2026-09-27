@@ -79,7 +79,7 @@ import { getCurrentLocale, translate, useI18n } from '../i18n';
 import type { MessageKey } from '../i18n/resources';
 import { MessageNotice, FloatingNotice, useAppNotice } from '../appNotice';
 import { AnyRouterGrabControls } from '../components/AnyRouterGrabControls';
-import { anyRouterGrabModel, isAnyRouterBaseUrl } from '../services/anyrouterLineGrab';
+import { anyRouterGrabModels, isAnyRouterBaseUrl } from '../services/anyrouterLineGrab';
 
 export type ProviderSection =
   | 'gemini-api-key'
@@ -1529,7 +1529,7 @@ export function ApiAccessPage() {
                         providerName: readString(row.record, 'name'),
                         baseUrl: row.baseUrl,
                         apiKey: row.apiKey,
-                        model: anyRouterGrabModel(row.models),
+                        models: anyRouterGrabModels(row.models),
                         customHeaders: providerHeadersFromRecord(row.record),
                       }}
                       onEnabled={() => loadProviders(false)}

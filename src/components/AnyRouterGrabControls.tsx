@@ -15,7 +15,7 @@ type ProviderTarget = {
   providerName: string;
   baseUrl: string;
   apiKey: string;
-  model: string;
+  models: string[];
   customHeaders?: Record<string, string>;
 };
 
@@ -29,6 +29,8 @@ export function AnyRouterGrabControls({
   const { t } = useI18n();
   const [intervalMs, setIntervalMs] = useState(ANYROUTER_GRAB_DEFAULT_INTERVAL_MS);
   const [threads, setThreads] = useState(ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
+  const [selectedModel, setSelectedModel] = useState('');
+  const modelList = target.models.filter((model) => model.trim()).join('\0');
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState<number | null>(null);
   const [result, setResult] = useState<GrabLoopResult | null>(null);
@@ -37,6 +39,11 @@ export function AnyRouterGrabControls({
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  useEffect(() => {
+    const names = modelList ? modelList.split('\0') : [];
+    setSelectedModel((current) => (current && names.includes(current) ? current : ''));
+  }, [modelList]);
 
   const applyUpdate = (update: GrabStatusUpdate) => {
     setStatus(update.status);
@@ -62,6 +69,13 @@ export function AnyRouterGrabControls({
   };
 
   const start = () => {
+    const model = selectedModel.trim();
+    if (!model) {
+      setResult({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
+      setNotice(null);
+      setBusyNote(false);
+      return;
+    }
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -74,7 +88,7 @@ export function AnyRouterGrabControls({
       baseUrl: target.baseUrl,
       apiKey: target.apiKey,
       providerName: target.providerName,
-      model: target.model,
+      model,
       customHeaders: target.customHeaders,
       intervalMs,
       concurrency: threads,
@@ -107,6 +121,19 @@ export function AnyRouterGrabControls({
 
   return (
     <div className="provider-grab-panel">
+      <label>
+        <span>{t('apiAccess.grab.model')}</span>
+        <select
+          value={selectedModel}
+          disabled={running}
+          onChange={(event) => setSelectedModel(event.currentTarget.value)}
+        >
+          <option value="">{t('apiAccess.grab.modelPlaceholder')}</option>
+          {target.models.map((model) => (
+            <option key={model} value={model}>{model}</option>
+          ))}
+        </select>
+      </label>
       <label>
         <span>{t('apiAccess.grab.interval')}</span>
         <input
@@ -163,7 +190,7 @@ function describeGrab(
   if (result.reason === 'success') return t('apiAccess.grab.success');
   if (result.reason === 'missing-key') return t('apiAccess.grab.missingKey');
   if (result.reason === 'missing-url') return t('apiAccess.grab.missingUrl');
-  if (result.reason === 'missing-model') return t('apiAccess.health.noModel');
+  if (result.reason === 'missing-model') return t('apiAccess.grab.missingModel');
   if (result.reason === 'missing-fingerprint') return t('apiAccess.grab.missingFingerprint');
   if (result.reason === 'enable-failed') return t('apiAccess.grab.enableFailed', { reason: result.detail });
   if (result.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: result.detail });

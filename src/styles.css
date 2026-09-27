@@ -5093,6 +5093,12 @@ textarea:focus-visible {
   min-height: 30px;
 }
 
+.provider-grab-panel select {
+  min-width: 180px;
+  max-width: 280px;
+  min-height: 30px;
+}
+
 .provider-grab-status,
 .provider-grab-message {
   color: var(--theme-7a746c);
