@@ -1,0 +1,227 @@
+name: Apple Silicon DMG
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-silicon-dmg-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    name: Darwin aarch64 DMG
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Restore Bun packages
+        id: bun-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-macos-15-1.3.14-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-macos-15-1.3.14-
+      - name: Cache Rust dependencies and build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-15
+          workspaces: src-tauri -> target
+          cache-workspace-crates: true
+          save-if: false
+      - name: Restore bundled core archive
+        id: core-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: cpa-core
+          key: core-v2-darwin-aarch64-${{ hashFiles('core-version.txt') }}
+      - name: Resolve package name
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node scripts/version.mjs)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stem=EasyCLIProxyAPI-v${version}-Darwin-aarch64" >> "$GITHUB_OUTPUT"
+      - name: Build GUI
+        env:
+          GITCODE_GUI_REPOSITORY: ${{ vars.GITCODE_GUI_REPOSITORY }}
+          GITCODE_CORE_REPOSITORY: ${{ vars.GITCODE_CORE_REPOSITORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun tauri build --no-bundle
+          binary_info="$(file src-tauri/target/release/cpa-gui)"
+          echo "$binary_info"
+          case "$binary_info" in
+            *arm64*) ;;
+            *)
+              echo "Expected a Darwin arm64 GUI binary" >&2
+              exit 1
+              ;;
+          esac
+      - name: Prepare portable directory
+        shell: bash
+        run: >-
+          node scripts/portable.mjs
+          --binary src-tauri/target/release/cpa-gui
+          --output "release/${{ steps.package.outputs.stem }}"
+          --os darwin
+          --arch aarch64
+          --download true
+      - name: Build Apple Silicon DMG
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PACKAGE_STEM: ${{ steps.package.outputs.stem }}
+        run: |
+          set -euo pipefail
+
+          output_dmg="${PACKAGE_STEM}.dmg"
+          app_path="src-tauri/target/release/bundle/macos/EasyCLIProxyAPI.app"
+          resources_dir="$app_path/Contents/Resources"
+          staging_dir="$RUNNER_TEMP/easycli-dmg-staging"
+
+          # Sign only when the certificate, its password, and the identity are all set.
+          # Empty signing secrets still produce an installable unsigned DMG.
+          sign=0
+          notarize=0
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            sign=1
+          fi
+          if [ "$sign" -eq 1 ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            notarize=1
+          fi
+
+          cp "release/${PACKAGE_STEM}/portable-app.json" portable-app.json
+
+          if [ "$sign" -eq 1 ]; then
+            echo "Apple signing secrets are present; building a signed DMG."
+            certificate_path="$RUNNER_TEMP/apple-signing-certificate.p12"
+            keychain_path="$RUNNER_TEMP/apple-signing.keychain-db"
+            keychain_password="$(uuidgen)"
+            signed_core_dir="$RUNNER_TEMP/signed-core"
+            unsigned_core_archive="$RUNNER_TEMP/unsigned-core-aarch64.tar.gz"
+            core_archive=""
+            keychain_list="$(security list-keychains -d user)"
+            existing_keychains=()
+            while IFS= read -r existing_keychain; do
+              existing_keychain="${existing_keychain#*\"}"
+              existing_keychain="${existing_keychain%\"*}"
+              if [ -n "$existing_keychain" ]; then
+                existing_keychains+=("$existing_keychain")
+              fi
+            done <<< "$keychain_list"
+
+            cleanup() {
+              set +e
+              if [ -n "$core_archive" ] && [ -f "$unsigned_core_archive" ]; then
+                cp "$unsigned_core_archive" "$core_archive"
+              fi
+              rm -f "$certificate_path"
+              rm -f "$unsigned_core_archive"
+              rm -rf "$signed_core_dir" "$staging_dir"
+              security delete-keychain "$keychain_path"
+            }
+            trap cleanup EXIT
+
+            (umask 077; printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$certificate_path")
+            security create-keychain -p "$keychain_password" "$keychain_path"
+            if [ "${#existing_keychains[@]}" -gt 0 ]; then
+              security list-keychains -d user -s "$keychain_path" "${existing_keychains[@]}"
+            else
+              security list-keychains -d user -s "$keychain_path"
+            fi
+            security set-keychain-settings -lut 21600 "$keychain_path"
+            security unlock-keychain -p "$keychain_password" "$keychain_path"
+            security import "$certificate_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+
+            core_archive="$(find cpa-core -maxdepth 1 -type f -name 'CLIProxyAPI_*_darwin_aarch64.tar.gz' -print -quit)"
+            if [ -z "$core_archive" ]; then
+              echo "CLIProxyAPI darwin aarch64 archive not found in cpa-core" >&2
+              exit 1
+            fi
+            cp "$core_archive" "$unsigned_core_archive"
+            mkdir -p "$signed_core_dir"
+            tar -xzf "$core_archive" -C "$signed_core_dir"
+            core_binary="$(find "$signed_core_dir" -type f -name 'cli-proxy-api' -print -quit)"
+            if [ -z "$core_binary" ]; then
+              echo "cli-proxy-api binary not found in the core archive" >&2
+              exit 1
+            fi
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain_path" "$core_binary"
+            signed_archive="$RUNNER_TEMP/$(basename "$core_archive")"
+            COPYFILE_DISABLE=1 tar -czf "$signed_archive" -C "$signed_core_dir" .
+            mv "$signed_archive" "$core_archive"
+
+            # Tauri's create-dmg script is unreliable on GitHub's macOS runners.
+            # Build the .app here, then create the DMG with hdiutil.
+            # Unset the certificate so Tauri uses the keychain imported above.
+            # Drop incomplete notarization credentials so a missing team id does not fail the bundle.
+            if [ "$notarize" -eq 1 ]; then
+              env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD \
+                bun tauri bundle --bundles app --ci --config src-tauri/tauri.dmg.conf.json
+            else
+              echo "Notarization secrets are empty; the DMG will be signed and not notarized."
+              env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID \
+                bun tauri bundle --bundles app --ci --config src-tauri/tauri.dmg.conf.json
+            fi
+          else
+            echo "Apple signing secrets are empty; building an unsigned DMG."
+            env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD -u APPLE_SIGNING_IDENTITY \
+                -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID \
+              bun tauri bundle --bundles app --ci --no-sign --config src-tauri/tauri.dmg.conf.json
+          fi
+
+          test -d "$app_path"
+          test ! -e "$app_path/Contents/MacOS/oauth"
+          test ! -e "$resources_dir/oauth"
+          test -s "$resources_dir/core-version.txt"
+
+          rm -rf "$staging_dir"
+          mkdir -p "$staging_dir"
+          ditto "$app_path" "$staging_dir/EasyCLIProxyAPI.app"
+          ln -s /Applications "$staging_dir/Applications"
+          hdiutil create \
+            -volname "EasyCLIProxyAPI" \
+            -srcfolder "$staging_dir" \
+            -format UDZO \
+            -ov \
+            "$output_dmg"
+
+          if [ "$sign" -eq 1 ]; then
+            codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain_path" "$output_dmg"
+          fi
+          if [ "$notarize" -eq 1 ]; then
+            xcrun notarytool submit "$output_dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$output_dmg"
+          fi
+
+          test -s "$output_dmg"
+          echo "DMG ready: $output_dmg ($(stat -f%z "$output_dmg") bytes)"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EasyCLIProxyAPI-Darwin-aarch64-dmg
+          path: ${{ steps.package.outputs.stem }}.dmg
+          if-no-files-found: error
+          retention-days: 14
