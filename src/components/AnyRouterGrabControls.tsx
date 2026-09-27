@@ -13,6 +13,8 @@ type ProviderTarget = {
   providerName: string;
   baseUrl: string;
   apiKey: string;
+  model: string;
+  customHeaders?: Record<string, string>;
 };
 
 const MIN_INTERVAL_SECONDS = ANYROUTER_GRAB_MIN_INTERVAL_MS / 1000;
@@ -60,6 +62,8 @@ export function AnyRouterGrabControls({
       baseUrl: target.baseUrl,
       apiKey: target.apiKey,
       providerName: target.providerName,
+      model: target.model,
+      customHeaders: target.customHeaders,
       intervalMs: Math.round(intervalSeconds * 1000),
       signal: controller.signal,
       onStatus: (update) => {
@@ -130,6 +134,7 @@ function describeGrab(
   if (result.reason === 'success') return t('apiAccess.grab.success');
   if (result.reason === 'missing-key') return t('apiAccess.grab.missingKey');
   if (result.reason === 'missing-url') return t('apiAccess.grab.missingUrl');
+  if (result.reason === 'missing-model') return t('apiAccess.health.noModel');
   if (result.reason === 'missing-fingerprint') return t('apiAccess.grab.missingFingerprint');
   if (result.reason === 'enable-failed') return t('apiAccess.grab.enableFailed', { reason: result.detail });
   if (result.reason === 'request-failed') return t('apiAccess.grab.requestFailed', { reason: result.detail });

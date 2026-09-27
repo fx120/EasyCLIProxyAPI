@@ -1,10 +1,12 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { managementApi } from '../src/services/managementApi';
-import { CODEX_CLIENT_FINGERPRINT_HEADERS } from '../src/services/quotaService';
+import { buildProviderHealthProbe } from '../src/services/providerHealthCheck';
+import { CODEX_CLIENT_FINGERPRINT_HEADERS, codexClientFingerprintHeaders } from '../src/services/quotaService';
 import {
   ANYROUTER_GRAB_MIN_INTERVAL_MS,
-  anyRouterGrabEndpoint,
   anyRouterGrabHeaders,
+  anyRouterGrabModel,
+  buildAnyRouterGrabProbe,
   clampGrabIntervalMs,
   classifyGrabStatus,
   findOpenAiCompatibilityIndex,
@@ -20,21 +22,49 @@ const provider = {
   'api-key-entries': [{ 'api-key': 'sk-test-key' }],
 };
 
+const grabTarget = {
+  baseUrl: 'https://anyrouter.top/v1',
+  apiKey: 'sk-test-key',
+  providerName: 'anyrouter_qidian8',
+  model: 'claude-sonnet-4-20250514',
+};
+
 describe('AnyRouter line grab', () => {
-  it('requests the configured OpenAI base through the models URL and reuses the Codex fingerprint', () => {
-    expect(anyRouterGrabEndpoint('https://anyrouter.top/v1')).toBe('https://anyrouter.top/v1/models');
+  it('uses the health-check chat completions probe and the Codex fingerprint', () => {
     expect(isAnyRouterBaseUrl('https://anyrouter.top/v1')).toBe(true);
     expect(isAnyRouterBaseUrl('https://api.example.com/v1')).toBe(false);
-    const headers = anyRouterGrabHeaders('sk-test-key');
-    expect(grabRequestHasCodexFingerprint(headers)).toBe(true);
-    expect(headers).toMatchObject({
+    expect(anyRouterGrabModel([
+      { name: 'gpt-5-codex' },
+      { name: 'claude-sonnet-4-20250514' },
+      { name: 'gemini-2.5-pro' },
+    ])).toBe('claude-sonnet-4-20250514');
+    const probe = buildAnyRouterGrabProbe(
+      'https://anyrouter.top/v1',
+      'claude-sonnet-4-20250514',
+      'sk-test-key',
+    );
+    expect(probe).toEqual(buildProviderHealthProbe(
+      'openai',
+      'https://anyrouter.top/v1',
+      'claude-sonnet-4-20250514',
+      'sk-test-key',
+      '',
+      codexClientFingerprintHeaders(),
+    ));
+    expect(probe.url).toBe('https://anyrouter.top/v1/chat/completions');
+    expect(probe.protocol).toBe('openai-chat');
+    expect(JSON.parse(probe.data)).toEqual({
+      model: 'claude-sonnet-4-20250514',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    expect(grabRequestHasCodexFingerprint(probe.header)).toBe(true);
+    expect(probe.header).toMatchObject({
       ...CODEX_CLIENT_FINGERPRINT_HEADERS,
       Authorization: 'Bearer sk-test-key',
     });
-    expect(headers['User-Agent']).toBe(CODEX_CLIENT_FINGERPRINT_HEADERS['User-Agent']);
-    expect(headers['OpenAI-Beta']).toBe('codex-1');
-    expect(headers.Originator).toBe('Codex Desktop');
-    expect(headers['Chatgpt-Account-Id']).toBeUndefined();
+    expect(probe.header['Chatgpt-Account-Id']).toBeUndefined();
+    expect(anyRouterGrabHeaders('sk-test-key').Authorization).toBe('Bearer sk-test-key');
   });
 
   it('keeps polling only on HTTP 500, succeeds only on 200 with the fingerprint, and stops on auth failures', () => {
@@ -65,21 +95,25 @@ describe('AnyRouter line grab', () => {
     const sleeps: number[] = [];
 
     const result = await runAnyRouterGrabLoop({
-      baseUrl: 'https://anyrouter.top/v1',
-      apiKey: 'sk-test-key',
-      providerName: 'anyrouter_qidian8',
+      ...grabTarget,
       intervalMs: 250,
       signal: new AbortController().signal,
       sleep: async (ms) => { sleeps.push(ms); },
     });
 
+    const probe = buildAnyRouterGrabProbe(grabTarget.baseUrl, grabTarget.model, grabTarget.apiKey);
     expect(result).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
     expect(post).toHaveBeenCalledTimes(2);
     expect(post.mock.calls[0]?.[0]).toBe('/api-call');
-    expect(post.mock.calls[0]?.[1]).toMatchObject({
-      method: 'GET',
-      url: 'https://anyrouter.top/v1/models',
-      header: anyRouterGrabHeaders('sk-test-key'),
+    expect(post.mock.calls[0]?.[1]).toEqual({
+      method: 'POST',
+      url: 'https://anyrouter.top/v1/chat/completions',
+      header: probe.header,
+      data: probe.data,
+    });
+    expect(post.mock.calls[1]?.[1]).toMatchObject({
+      method: 'POST',
+      url: 'https://anyrouter.top/v1/chat/completions',
     });
     expect(sleeps).toEqual([1_000]);
     expect(patch).toHaveBeenCalledTimes(1);
@@ -99,9 +133,7 @@ describe('AnyRouter line grab', () => {
     } as never);
     const patch = spyOn(managementApi, 'patch');
     const result = await runAnyRouterGrabLoop({
-      baseUrl: 'https://anyrouter.top/v1',
-      apiKey: 'sk-test-key',
-      providerName: 'anyrouter_qidian8',
+      ...grabTarget,
       intervalMs: 1_000,
       signal: new AbortController().signal,
       sleep: async () => { throw new Error('should not wait'); },
@@ -115,13 +147,44 @@ describe('AnyRouter line grab', () => {
     patch.mockRestore();
   });
 
+  it('stops on 404 without treating an unsupported model as a grab', async () => {
+    const post = spyOn(managementApi, 'post').mockResolvedValue({
+      status_code: 404,
+      body: { error: { message: '当前 API 不支持所选模型' } },
+    } as never);
+    const patch = spyOn(managementApi, 'patch');
+    const result = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      intervalMs: 1_000,
+      signal: new AbortController().signal,
+      sleep: async () => { throw new Error('should not wait'); },
+    });
+    expect(result).toMatchObject({ phase: 'stopped', reason: 'other', status: 404 });
+    expect(result.detail).toContain('当前 API 不支持所选模型');
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(patch).not.toHaveBeenCalled();
+    post.mockRestore();
+    patch.mockRestore();
+  });
+
+  it('does not request when the provider has no health-check model', async () => {
+    const post = spyOn(managementApi, 'post');
+    const result = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      model: '  ',
+      intervalMs: 1_000,
+      signal: new AbortController().signal,
+    });
+    expect(result).toMatchObject({ phase: 'stopped', reason: 'missing-model', status: null });
+    expect(post).not.toHaveBeenCalled();
+    post.mockRestore();
+  });
+
   it('does not send another request after stop during the busy wait', async () => {
     const post = spyOn(managementApi, 'post').mockResolvedValue({ status_code: 500 } as never);
     const controller = new AbortController();
     const result = await runAnyRouterGrabLoop({
-      baseUrl: 'https://anyrouter.top/v1',
-      apiKey: 'sk-test-key',
-      providerName: 'anyrouter_qidian8',
+      ...grabTarget,
       intervalMs: 5_000,
       signal: controller.signal,
       onStatus: (update) => {

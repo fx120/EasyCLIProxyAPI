@@ -1,4 +1,4 @@
-import { modelEndpointCandidates, normalizeBaseUrl } from './modelService';
+import { normalizeBaseUrl, type ModelOption } from './modelService';
 import {
   apiCallErrorMessage,
   isRecord,
@@ -6,6 +6,11 @@ import {
   readString,
   responseList,
 } from './managementApi';
+import {
+  buildProviderHealthProbe,
+  mergeProviderHealthModels,
+  PROVIDER_HEALTH_TIMEOUT_MS,
+} from './providerHealthCheck';
 import {
   CODEX_CLIENT_FINGERPRINT_HEADERS,
   codexClientFingerprintHeaders,
@@ -36,6 +41,7 @@ export type GrabStopReason =
   | 'missing-fingerprint'
   | 'missing-key'
   | 'missing-url'
+  | 'missing-model'
   | 'request-failed'
   | 'enable-failed'
   | 'aborted';
@@ -68,11 +74,24 @@ export function isAnyRouterBaseUrl(baseUrl: string): boolean {
   }
 }
 
-/** Models URL this console already requests for an OpenAI-compatible base. */
-export function anyRouterGrabEndpoint(baseUrl: string): string {
-  const endpoint = modelEndpointCandidates('openai', baseUrl)[0] ?? '';
-  if (!endpoint) throw new Error('missing base url');
-  return endpoint;
+/** First model name from the same list 健康检测 starts with. */
+export function anyRouterGrabModel(models: ModelOption[]): string {
+  return mergeProviderHealthModels([], models)[0]?.name.trim() ?? '';
+}
+
+/** Chat-completions probe 健康检测 already builds for an OpenAI-compatible base. */
+export function buildAnyRouterGrabProbe(
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+  customHeaders: Record<string, string> = {},
+) {
+  if (!baseUrl.trim()) throw new Error('missing base url');
+  if (!model.trim()) throw new Error('missing model');
+  return buildProviderHealthProbe('openai', baseUrl, model, apiKey, '', {
+    ...customHeaders,
+    ...codexClientFingerprintHeaders(),
+  });
 }
 
 export function clampGrabIntervalMs(value: number): number {
@@ -180,6 +199,8 @@ export async function runAnyRouterGrabLoop(options: {
   baseUrl: string;
   apiKey: string;
   providerName: string;
+  model: string;
+  customHeaders?: Record<string, string>;
   intervalMs: number;
   signal: AbortSignal;
   onStatus?: (update: GrabStatusUpdate) => void;
@@ -207,20 +228,25 @@ export async function runAnyRouterGrabLoop(options: {
     return finish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
   }
 
-  let endpoint = '';
+  let probe;
   try {
-    endpoint = anyRouterGrabEndpoint(options.baseUrl);
+    probe = buildAnyRouterGrabProbe(options.baseUrl, options.model, apiKey, options.customHeaders);
   } catch (error) {
+    const message = errorText(error);
+    if (message === 'missing model') {
+      return finish({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
+    }
     return finish({
       phase: 'stopped',
       status: null,
       reason: 'missing-url',
-      detail: errorText(error),
+      detail: message === 'missing base url' ? '' : message,
     });
   }
-
-  const headers = anyRouterGrabHeaders(apiKey);
-  if (!grabRequestHasCodexFingerprint(headers)) {
+  if (!probe.url) {
+    return finish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
+  }
+  if (!grabRequestHasCodexFingerprint(probe.header)) {
     return finish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '' });
   }
 
@@ -229,10 +255,11 @@ export async function runAnyRouterGrabLoop(options: {
     let response: Record<string, unknown>;
     try {
       response = await managementApi.post<Record<string, unknown>>('/api-call', {
-        method: 'GET',
-        url: endpoint,
-        header: headers,
-      }, { timeoutMs: 20_000 });
+        method: 'POST',
+        url: probe.url,
+        header: probe.header,
+        data: probe.data,
+      }, { timeoutMs: PROVIDER_HEALTH_TIMEOUT_MS });
     } catch (error) {
       if (options.signal.aborted) {
         return { phase: 'stopped', status: null, reason: 'aborted', detail: '' };
@@ -249,7 +276,7 @@ export async function runAnyRouterGrabLoop(options: {
     }
 
     const status = readGrabStatusCode(response);
-    const decision = classifyGrabStatus(status, grabRequestHasCodexFingerprint(headers));
+    const decision = classifyGrabStatus(status, grabRequestHasCodexFingerprint(probe.header));
     if (decision.action === 'retry') {
       options.onStatus?.({ phase: 'running', status, reason: 'busy', detail: '' });
       await sleep(intervalMs, options.signal);
