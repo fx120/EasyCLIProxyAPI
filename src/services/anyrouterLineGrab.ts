@@ -16,8 +16,10 @@ import {
   codexClientFingerprintHeaders,
 } from './quotaService';
 
-export const ANYROUTER_GRAB_MIN_INTERVAL_MS = 1_000;
+export const ANYROUTER_GRAB_MIN_INTERVAL_MS = 50;
 export const ANYROUTER_GRAB_DEFAULT_INTERVAL_MS = 2_000;
+export const ANYROUTER_GRAB_MAX_CONCURRENCY = 32;
+export const ANYROUTER_GRAB_DEFAULT_CONCURRENCY = 1;
 
 const FINGERPRINT_NAMES = Object.keys(CODEX_CLIENT_FINGERPRINT_HEADERS) as Array<
   keyof typeof CODEX_CLIENT_FINGERPRINT_HEADERS
@@ -31,8 +33,9 @@ export type OpenAiProviderMatch = {
 
 export type GrabDecision =
   | { action: 'retry' }
+  | { action: 'continue' }
   | { action: 'success' }
-  | { action: 'stop'; reason: 'auth' | 'other' | 'missing-fingerprint' };
+  | { action: 'stop'; reason: 'auth' | 'missing-fingerprint' };
 
 export type GrabStopReason =
   | 'success'
@@ -99,6 +102,11 @@ export function clampGrabIntervalMs(value: number): number {
   return Math.max(ANYROUTER_GRAB_MIN_INTERVAL_MS, Math.round(value));
 }
 
+export function clampGrabConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return ANYROUTER_GRAB_DEFAULT_CONCURRENCY;
+  return Math.min(ANYROUTER_GRAB_MAX_CONCURRENCY, Math.max(1, Math.round(value)));
+}
+
 export function anyRouterGrabHeaders(apiKey: string): Record<string, string> {
   return {
     ...codexClientFingerprintHeaders(),
@@ -118,7 +126,7 @@ export function classifyGrabStatus(status: number, fingerprintPresent: boolean):
   }
   if (status === 500) return { action: 'retry' };
   if (status === 401 || status === 403) return { action: 'stop', reason: 'auth' };
-  return { action: 'stop', reason: 'other' };
+  return { action: 'continue' };
 }
 
 export function readGrabStatusCode(response: Record<string, unknown>): number {
@@ -202,12 +210,13 @@ export async function runAnyRouterGrabLoop(options: {
   model: string;
   customHeaders?: Record<string, string>;
   intervalMs: number;
+  concurrency?: number;
   signal: AbortSignal;
   onStatus?: (update: GrabStatusUpdate) => void;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }): Promise<GrabLoopResult> {
   const sleep = options.sleep ?? waitForGrabInterval;
-  const finish = (result: GrabLoopResult): GrabLoopResult => {
+  const publish = (result: GrabLoopResult): GrabLoopResult => {
     if (options.signal.aborted && result.reason !== 'success') {
       return { phase: 'stopped', status: result.status, reason: 'aborted', detail: '' };
     }
@@ -222,10 +231,10 @@ export async function runAnyRouterGrabLoop(options: {
 
   const apiKey = options.apiKey.trim();
   if (!apiKey) {
-    return finish({ phase: 'stopped', status: null, reason: 'missing-key', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-key', detail: '' });
   }
   if (!options.baseUrl.trim()) {
-    return finish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
   }
 
   let probe;
@@ -234,9 +243,9 @@ export async function runAnyRouterGrabLoop(options: {
   } catch (error) {
     const message = errorText(error);
     if (message === 'missing model') {
-      return finish({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
+      return publish({ phase: 'stopped', status: null, reason: 'missing-model', detail: '' });
     }
-    return finish({
+    return publish({
       phase: 'stopped',
       status: null,
       reason: 'missing-url',
@@ -244,67 +253,111 @@ export async function runAnyRouterGrabLoop(options: {
     });
   }
   if (!probe.url) {
-    return finish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-url', detail: '' });
   }
   if (!grabRequestHasCodexFingerprint(probe.header)) {
-    return finish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '' });
+    return publish({ phase: 'stopped', status: null, reason: 'missing-fingerprint', detail: '' });
   }
 
   const intervalMs = clampGrabIntervalMs(options.intervalMs);
-  while (!options.signal.aborted) {
-    let response: Record<string, unknown>;
-    try {
-      response = await managementApi.post<Record<string, unknown>>('/api-call', {
-        method: 'POST',
-        url: probe.url,
-        header: probe.header,
-        data: probe.data,
-      }, { timeoutMs: PROVIDER_HEALTH_TIMEOUT_MS });
-    } catch (error) {
-      if (options.signal.aborted) {
-        return { phase: 'stopped', status: null, reason: 'aborted', detail: '' };
-      }
-      return finish({
-        phase: 'stopped',
-        status: null,
-        reason: 'request-failed',
-        detail: errorText(error),
-      });
-    }
-    if (options.signal.aborted) {
-      return { phase: 'stopped', status: readGrabStatusCode(response), reason: 'aborted', detail: '' };
-    }
+  const workerCount = clampGrabConcurrency(options.concurrency ?? ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
+  const stopAll = new AbortController();
+  const abortStopAll = () => stopAll.abort();
+  if (options.signal.aborted) stopAll.abort();
+  else options.signal.addEventListener('abort', abortStopAll, { once: true });
 
-    const status = readGrabStatusCode(response);
-    const decision = classifyGrabStatus(status, grabRequestHasCodexFingerprint(probe.header));
-    if (decision.action === 'retry') {
-      options.onStatus?.({ phase: 'running', status, reason: 'busy', detail: '' });
-      await sleep(intervalMs, options.signal);
-      continue;
-    }
-    if (decision.action === 'success') {
+  const gate: { claimed: boolean; terminal: GrabLoopResult | null } = {
+    claimed: false,
+    terminal: null,
+  };
+  const claim = () => {
+    if (gate.claimed || options.signal.aborted) return false;
+    gate.claimed = true;
+    stopAll.abort();
+    return true;
+  };
+  const noteRunning = (update: GrabStatusUpdate) => {
+    if (options.signal.aborted || gate.claimed) return;
+    options.onStatus?.(update);
+  };
+
+  const worker = async () => {
+    while (!options.signal.aborted && !gate.claimed) {
+      let response: Record<string, unknown>;
       try {
-        await enableOpenAiCompatibilityProvider({
-          name: options.providerName,
-          baseUrl: options.baseUrl,
-          apiKey,
-        });
+        response = await managementApi.post<Record<string, unknown>>('/api-call', {
+          method: 'POST',
+          url: probe.url,
+          header: probe.header,
+          data: probe.data,
+        }, { timeoutMs: PROVIDER_HEALTH_TIMEOUT_MS });
       } catch (error) {
-        return finish({
-          phase: 'stopped',
-          status,
-          reason: 'enable-failed',
+        if (options.signal.aborted || gate.claimed) return;
+        noteRunning({
+          phase: 'running',
+          status: null,
+          reason: 'request-failed',
           detail: errorText(error),
         });
+        await sleep(intervalMs, stopAll.signal);
+        continue;
       }
-      return finish({ phase: 'succeeded', status, reason: 'success', detail: '' });
+      if (options.signal.aborted || gate.claimed) return;
+
+      const status = readGrabStatusCode(response);
+      const decision = classifyGrabStatus(status, grabRequestHasCodexFingerprint(probe.header));
+      if (decision.action === 'retry') {
+        noteRunning({ phase: 'running', status, reason: 'busy', detail: '' });
+        await sleep(intervalMs, stopAll.signal);
+        continue;
+      }
+      if (decision.action === 'continue') {
+        noteRunning({
+          phase: 'running',
+          status,
+          reason: 'other',
+          detail: apiCallErrorMessage(response),
+        });
+        await sleep(intervalMs, stopAll.signal);
+        continue;
+      }
+      if (!claim()) return;
+      if (decision.action === 'success') {
+        try {
+          await enableOpenAiCompatibilityProvider({
+            name: options.providerName,
+            baseUrl: options.baseUrl,
+            apiKey,
+          });
+          gate.terminal = { phase: 'succeeded', status, reason: 'success', detail: '' };
+        } catch (error) {
+          gate.terminal = {
+            phase: 'stopped',
+            status,
+            reason: 'enable-failed',
+            detail: errorText(error),
+          };
+        }
+        return;
+      }
+      gate.terminal = {
+        phase: 'stopped',
+        status,
+        reason: decision.reason,
+        detail: apiCallErrorMessage(response),
+      };
     }
-    return finish({
-      phase: 'stopped',
-      status,
-      reason: decision.reason,
-      detail: apiCallErrorMessage(response),
-    });
+  };
+
+  try {
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  } finally {
+    options.signal.removeEventListener('abort', abortStopAll);
   }
-  return { phase: 'stopped', status: null, reason: 'aborted', detail: '' };
+
+  const terminal = gate.terminal;
+  if (terminal?.reason === 'success' || (terminal && !options.signal.aborted)) {
+    return publish(terminal);
+  }
+  return { phase: 'stopped', status: terminal?.status ?? null, reason: 'aborted', detail: '' };
 }

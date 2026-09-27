@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../i18n';
 import type { MessageKey, MessageVariables } from '../i18n/resources';
 import {
+  ANYROUTER_GRAB_DEFAULT_CONCURRENCY,
   ANYROUTER_GRAB_DEFAULT_INTERVAL_MS,
+  ANYROUTER_GRAB_MAX_CONCURRENCY,
   ANYROUTER_GRAB_MIN_INTERVAL_MS,
   runAnyRouterGrabLoop,
   type GrabLoopResult,
@@ -17,9 +19,6 @@ type ProviderTarget = {
   customHeaders?: Record<string, string>;
 };
 
-const MIN_INTERVAL_SECONDS = ANYROUTER_GRAB_MIN_INTERVAL_MS / 1000;
-const DEFAULT_INTERVAL_SECONDS = ANYROUTER_GRAB_DEFAULT_INTERVAL_MS / 1000;
-
 export function AnyRouterGrabControls({
   target,
   onEnabled,
@@ -28,10 +27,12 @@ export function AnyRouterGrabControls({
   onEnabled: () => Promise<void> | void;
 }) {
   const { t } = useI18n();
-  const [intervalSeconds, setIntervalSeconds] = useState(DEFAULT_INTERVAL_SECONDS);
+  const [intervalMs, setIntervalMs] = useState(ANYROUTER_GRAB_DEFAULT_INTERVAL_MS);
+  const [threads, setThreads] = useState(ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState<number | null>(null);
   const [result, setResult] = useState<GrabLoopResult | null>(null);
+  const [notice, setNotice] = useState<GrabLoopResult | null>(null);
   const [busyNote, setBusyNote] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -39,9 +40,19 @@ export function AnyRouterGrabControls({
 
   const applyUpdate = (update: GrabStatusUpdate) => {
     setStatus(update.status);
-    setBusyNote(update.reason === 'busy');
-    if (update.phase === 'running') return;
+    const busy = update.phase === 'running' && update.reason === 'busy';
+    setBusyNote(busy);
+    if (update.phase === 'running') {
+      setNotice(busy || update.reason === 'busy' ? null : {
+        phase: 'stopped',
+        status: update.status,
+        reason: update.reason,
+        detail: update.detail,
+      });
+      return;
+    }
     setRunning(false);
+    setNotice(null);
     setResult({
       phase: update.phase === 'succeeded' ? 'succeeded' : 'stopped',
       status: update.status,
@@ -56,6 +67,7 @@ export function AnyRouterGrabControls({
     abortRef.current = controller;
     setRunning(true);
     setResult(null);
+    setNotice(null);
     setBusyNote(false);
     setStatus(null);
     void runAnyRouterGrabLoop({
@@ -64,7 +76,8 @@ export function AnyRouterGrabControls({
       providerName: target.providerName,
       model: target.model,
       customHeaders: target.customHeaders,
-      intervalMs: Math.round(intervalSeconds * 1000),
+      intervalMs,
+      concurrency: threads,
       signal: controller.signal,
       onStatus: (update) => {
         if (abortRef.current !== controller) return;
@@ -83,13 +96,14 @@ export function AnyRouterGrabControls({
   const stop = () => {
     abortRef.current?.abort();
     abortRef.current = null;
-    setRunning(false);
-    setBusyNote(false);
-    setResult({ phase: 'stopped', status, reason: 'aborted', detail: '' });
+      setRunning(false);
+      setBusyNote(false);
+      setNotice(null);
+      setResult({ phase: 'stopped', status, reason: 'aborted', detail: '' });
   };
 
   const statusLabel = status === null ? '—' : String(status);
-  const message = describeGrab(result, busyNote, t);
+  const message = describeGrab(result ?? notice, busyNote, t);
 
   return (
     <div className="provider-grab-panel">
@@ -97,13 +111,28 @@ export function AnyRouterGrabControls({
         <span>{t('apiAccess.grab.interval')}</span>
         <input
           type="number"
-          min={MIN_INTERVAL_SECONDS}
-          step={1}
-          value={intervalSeconds}
+          min={ANYROUTER_GRAB_MIN_INTERVAL_MS}
+          step={50}
+          value={intervalMs}
           disabled={running}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);
-            setIntervalSeconds(Number.isFinite(next) ? next : DEFAULT_INTERVAL_SECONDS);
+            setIntervalMs(Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_INTERVAL_MS);
+          }}
+        />
+      </label>
+      <label>
+        <span>{t('apiAccess.grab.threads')}</span>
+        <input
+          type="number"
+          min={1}
+          max={ANYROUTER_GRAB_MAX_CONCURRENCY}
+          step={1}
+          value={threads}
+          disabled={running}
+          onChange={(event) => {
+            const next = Number(event.currentTarget.value);
+            setThreads(Number.isFinite(next) ? next : ANYROUTER_GRAB_DEFAULT_CONCURRENCY);
           }}
         />
       </label>

@@ -3,10 +3,12 @@ import { managementApi } from '../src/services/managementApi';
 import { buildProviderHealthProbe } from '../src/services/providerHealthCheck';
 import { CODEX_CLIENT_FINGERPRINT_HEADERS, codexClientFingerprintHeaders } from '../src/services/quotaService';
 import {
+  ANYROUTER_GRAB_MAX_CONCURRENCY,
   ANYROUTER_GRAB_MIN_INTERVAL_MS,
   anyRouterGrabHeaders,
   anyRouterGrabModel,
   buildAnyRouterGrabProbe,
+  clampGrabConcurrency,
   clampGrabIntervalMs,
   classifyGrabStatus,
   findOpenAiCompatibilityIndex,
@@ -67,16 +69,21 @@ describe('AnyRouter line grab', () => {
     expect(anyRouterGrabHeaders('sk-test-key').Authorization).toBe('Bearer sk-test-key');
   });
 
-  it('keeps polling only on HTTP 500, succeeds only on 200 with the fingerprint, and stops on auth failures', () => {
+  it('keeps polling on HTTP 500 and other non-auth failures, succeeds only on 200, and stops on auth failures', () => {
     expect(classifyGrabStatus(500, true)).toEqual({ action: 'retry' });
     expect(classifyGrabStatus(200, true)).toEqual({ action: 'success' });
     expect(classifyGrabStatus(200, false)).toEqual({ action: 'stop', reason: 'missing-fingerprint' });
     expect(classifyGrabStatus(401, true)).toEqual({ action: 'stop', reason: 'auth' });
     expect(classifyGrabStatus(403, true)).toEqual({ action: 'stop', reason: 'auth' });
-    expect(classifyGrabStatus(404, true)).toEqual({ action: 'stop', reason: 'other' });
-    expect(classifyGrabStatus(502, true)).toEqual({ action: 'stop', reason: 'other' });
-    expect(clampGrabIntervalMs(200)).toBe(ANYROUTER_GRAB_MIN_INTERVAL_MS);
+    expect(classifyGrabStatus(404, true)).toEqual({ action: 'continue' });
+    expect(classifyGrabStatus(502, true)).toEqual({ action: 'continue' });
+    expect(clampGrabIntervalMs(10)).toBe(ANYROUTER_GRAB_MIN_INTERVAL_MS);
+    expect(clampGrabIntervalMs(200)).toBe(200);
     expect(clampGrabIntervalMs(Number.NaN)).toBe(2_000);
+    expect(clampGrabConcurrency(0)).toBe(1);
+    expect(clampGrabConcurrency(4.2)).toBe(4);
+    expect(clampGrabConcurrency(100)).toBe(ANYROUTER_GRAB_MAX_CONCURRENCY);
+    expect(clampGrabConcurrency(Number.NaN)).toBe(1);
   });
 
   it('enables the matching OpenAI-compatible entry after 200 and does not request again', async () => {
@@ -115,7 +122,7 @@ describe('AnyRouter line grab', () => {
       method: 'POST',
       url: 'https://anyrouter.top/v1/chat/completions',
     });
-    expect(sleeps).toEqual([1_000]);
+    expect(sleeps).toEqual([250]);
     expect(patch).toHaveBeenCalledTimes(1);
     expect(patch).toHaveBeenCalledWith('/openai-compatibility', {
       index: 0,
@@ -147,23 +154,112 @@ describe('AnyRouter line grab', () => {
     patch.mockRestore();
   });
 
-  it('stops on 404 without treating an unsupported model as a grab', async () => {
-    const post = spyOn(managementApi, 'post').mockResolvedValue({
-      status_code: 404,
-      body: { error: { message: '当前 API 不支持所选模型' } },
-    } as never);
+  it('keeps grabbing after 404 until another probe returns 200', async () => {
+    const post = spyOn(managementApi, 'post');
+    const get = spyOn(managementApi, 'get');
     const patch = spyOn(managementApi, 'patch');
+    const queue = [404, 200];
+    post.mockImplementation(async () => {
+      const status = queue.shift() ?? 500;
+      return {
+        status_code: status,
+        body: status === 404 ? { error: { message: '当前 API 不支持所选模型' } } : {},
+      } as never;
+    });
+    get.mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    patch.mockResolvedValue({} as never);
+    const notices: string[] = [];
+
     const result = await runAnyRouterGrabLoop({
       ...grabTarget,
-      intervalMs: 1_000,
+      concurrency: 2,
+      intervalMs: 50,
+      signal: new AbortController().signal,
+      onStatus: (update) => {
+        if (update.reason === 'other') notices.push(update.detail);
+      },
+      sleep: async (_ms, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    });
+
+    expect(result).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
+    expect(notices.some((detail) => detail.includes('当前 API 不支持所选模型'))).toBe(true);
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(patch).toHaveBeenCalledTimes(1);
+    post.mockRestore();
+    get.mockRestore();
+    patch.mockRestore();
+  });
+
+  it('stops every thread on 401 and enables the provider only once when two probes return 200', async () => {
+    const post = spyOn(managementApi, 'post');
+    const get = spyOn(managementApi, 'get');
+    const patch = spyOn(managementApi, 'patch');
+    get.mockResolvedValue({ 'openai-compatibility': [provider] } as never);
+    patch.mockResolvedValue({} as never);
+
+    const authQueue = [500, 401];
+    post.mockImplementation(async () => {
+      const status = authQueue.shift() ?? 500;
+      return { status_code: status, body: { error: { message: '无效的令牌' } } } as never;
+    });
+    const authResult = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      concurrency: 2,
+      intervalMs: 50,
+      signal: new AbortController().signal,
+      sleep: async (_ms, signal) => {
+        if (signal.aborted) return;
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    });
+    expect(authResult).toMatchObject({ phase: 'stopped', reason: 'auth', status: 401 });
+    expect(authResult.detail).toContain('无效的令牌');
+    expect(patch).not.toHaveBeenCalled();
+
+    post.mockResolvedValue({ status_code: 200, body: {} } as never);
+    const success = await runAnyRouterGrabLoop({
+      ...grabTarget,
+      concurrency: 2,
+      intervalMs: 50,
       signal: new AbortController().signal,
       sleep: async () => { throw new Error('should not wait'); },
     });
-    expect(result).toMatchObject({ phase: 'stopped', reason: 'other', status: 404 });
-    expect(result.detail).toContain('当前 API 不支持所选模型');
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(patch).not.toHaveBeenCalled();
+    expect(success).toMatchObject({ phase: 'succeeded', status: 200, reason: 'success' });
+    expect(patch).toHaveBeenCalledTimes(1);
+
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const opened = new Promise<void>((resolve) => {
+      post.mockImplementation(async () => {
+        started += 1;
+        if (started === ANYROUTER_GRAB_MAX_CONCURRENCY) resolve();
+        await gate;
+        return { status_code: 401, body: { error: { message: '无效的令牌' } } } as never;
+      });
+    });
+    const capped = runAnyRouterGrabLoop({
+      ...grabTarget,
+      concurrency: 100,
+      intervalMs: 50,
+      signal: new AbortController().signal,
+      sleep: async () => { throw new Error('should not wait'); },
+    });
+    await opened;
+    expect(started).toBe(ANYROUTER_GRAB_MAX_CONCURRENCY);
+    release();
+    await expect(capped).resolves.toMatchObject({ reason: 'auth', status: 401 });
+    expect(patch).toHaveBeenCalledTimes(1);
+
     post.mockRestore();
+    get.mockRestore();
     patch.mockRestore();
   });
 
